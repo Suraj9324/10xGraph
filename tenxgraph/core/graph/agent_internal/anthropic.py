@@ -1,0 +1,320 @@
+"""Anthropic request helpers for Agent."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from tenxgraph.core.llm.client_factory import ANTHROPIC_CLIENT_KWARGS
+
+from .anthropic_request import (
+    apply_cache_control,
+    bare_model_id,
+    convert_tools,
+    drop_trailing_assistant,
+    merge_tool_results,
+    split_system,
+)
+from .constants import (
+    ANTHROPIC_DEFAULT_MAX_TOKENS,
+    ANTHROPIC_DEFAULT_MAX_TOKENS_STREAMING,
+    ANTHROPIC_LEGACY_BUDGET_BY_EFFORT,
+    ANTHROPIC_LEGACY_EFFORT_PREFIXES,
+    ANTHROPIC_LEGACY_THINKING_PREFIXES,
+    ANTHROPIC_MIN_THINKING_BUDGET,
+    ANTHROPIC_NO_SAMPLING_MODELS,
+    CALL_EXCLUDED_KWARGS,
+    reasoning_for,
+)
+from .sdk_kwargs import accepted_params, filter_kwargs
+
+
+logger = logging.getLogger("tenxgraph.agent")
+
+# Rejected with a 400 by the models in ANTHROPIC_NO_SAMPLING_MODELS.
+_SAMPLING_KEYS = ("temperature", "top_p", "top_k")
+
+# Anthropic client-constructor keys (they went to the client) and the OpenAI-style effort key;
+# none is a request parameter. The keys 10xGraph reads itself are in CALL_EXCLUDED_KWARGS.
+_ANTHROPIC_EXCLUDED_KWARGS = (
+    CALL_EXCLUDED_KWARGS | ANTHROPIC_CLIENT_KWARGS | frozenset({"reasoning_effort"})
+)
+
+
+def _drop_sampling_params(model: str, call_kwargs: dict[str, Any], when: str) -> None:
+    """Remove temperature/top_p/top_k from ``call_kwargs`` in place, with one warning."""
+    dropped = [key for key in _SAMPLING_KEYS if key in call_kwargs]
+    for key in dropped:
+        call_kwargs.pop(key)
+    if dropped:
+        logger.warning(
+            "Model %s rejects sampling parameters%s; dropped %s from the request.",
+            model,
+            when,
+            ", ".join(dropped),
+        )
+
+
+def rejects_sampling(model: str) -> bool:
+    """True for Claude models that answer temperature/top_p/top_k with a 400."""
+    return bare_model_id(model) in ANTHROPIC_NO_SAMPLING_MODELS
+
+
+def strip_rejected_sampling_params(model: str, call_kwargs: dict[str, Any]) -> None:
+    """Drop temperature/top_p/top_k for models that 400 on them, in place."""
+    if rejects_sampling(model):
+        _drop_sampling_params(model, call_kwargs, " (use reasoning_config effort instead)")
+
+
+def is_legacy_thinking_model(model: str) -> bool:
+    """True for Claude models before 4.6, which need budget-based thinking."""
+    return bare_model_id(model).startswith(ANTHROPIC_LEGACY_THINKING_PREFIXES)
+
+
+def _apply_legacy_reasoning(
+    model: str,
+    reasoning_config: dict[str, Any],
+    call_kwargs: dict[str, Any],
+) -> None:
+    """Budget-based thinking for pre-4.6 models, in place."""
+    effort = reasoning_config.get("effort")
+    if effort and bare_model_id(model).startswith(ANTHROPIC_LEGACY_EFFORT_PREFIXES):
+        # Opus 4.5 accepts low/medium/high only.
+        output_config = dict(call_kwargs.get("output_config") or {})
+        output_config.setdefault("effort", "high" if effort in ("xhigh", "max") else effort)
+        call_kwargs["output_config"] = output_config
+
+    if "thinking" in call_kwargs:
+        return
+
+    max_tokens = call_kwargs.get("max_tokens")
+    if max_tokens is not None and max_tokens <= ANTHROPIC_MIN_THINKING_BUDGET:
+        logger.warning(
+            "Model %s needs max_tokens above %d for thinking (got %s); thinking skipped.",
+            model,
+            ANTHROPIC_MIN_THINKING_BUDGET,
+            max_tokens,
+        )
+        return
+
+    budget = reasoning_config.get("budget_tokens") or reasoning_config.get("thinking_budget")
+    if not budget:
+        budget = ANTHROPIC_LEGACY_BUDGET_BY_EFFORT.get(effort or "", None)
+    if not budget:
+        budget = ANTHROPIC_LEGACY_BUDGET_BY_EFFORT["low"]
+    budget = max(int(budget), ANTHROPIC_MIN_THINKING_BUDGET)
+    if max_tokens is not None:
+        budget = min(budget, max_tokens - 1)
+    call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+
+    # Thinking rejects top_k and any non-default temperature; drop them like the
+    # no-sampling models do.
+    _drop_sampling_params(model, call_kwargs, " with thinking on")
+
+
+def apply_reasoning_config(
+    reasoning_config: dict[str, Any] | None,
+    call_kwargs: dict[str, Any],
+    model: str = "",
+) -> None:
+    """Map agentflow's reasoning_config onto Anthropic thinking/effort, in place.
+
+    Claude 4.6 and newer (and unknown models): ``thinking={"type": "adaptive"}`` plus
+    ``output_config.effort``. ``budget_tokens`` is never emitted there: it is removed on
+    those models and returns a 400. ``thinking.display`` is sent only when
+    ``reasoning_config`` has a ``display`` key; the API default is "omitted".
+
+    Older models (Haiku 4.5, Sonnet 4.5, Opus 4.5 and before, see
+    ``ANTHROPIC_LEGACY_THINKING_PREFIXES``) reject adaptive thinking. They get
+    ``thinking={"type": "enabled", "budget_tokens": N}``: N is ``budget_tokens`` or
+    ``thinking_budget`` from the config, else mapped from effort (low 1024, medium 4096,
+    high 8192, xhigh/max 16384), at least 1024 and below ``max_tokens``. With ``max_tokens``
+    of 1024 or less thinking is skipped. ``display`` is dropped, ``output_config.effort`` is
+    sent only for Opus 4.5 (xhigh/max sent as high), and temperature, top_p and top_k are
+    dropped because thinking rejects them.
+
+    A ``thinking`` already in ``call_kwargs`` always wins.
+    """
+    if not reasoning_config:
+        return
+
+    if is_legacy_thinking_model(model):
+        _apply_legacy_reasoning(model, reasoning_config, call_kwargs)
+        return
+
+    thinking = {"type": "adaptive"}
+    if reasoning_config.get("display"):
+        thinking["display"] = reasoning_config["display"]
+    call_kwargs.setdefault("thinking", thinking)
+
+    effort = reasoning_config.get("effort")
+    if effort:
+        output_config = dict(call_kwargs.get("output_config") or {})
+        output_config.setdefault("effort", effort)
+        call_kwargs["output_config"] = output_config
+
+    if reasoning_config.get("thinking_budget") or reasoning_config.get("budget_tokens"):
+        logger.warning(
+            "budget_tokens/thinking_budget is not supported by current Claude "
+            "models and would return a 400; ignoring it. Use "
+            "reasoning_config={'effort': ...} instead."
+        )
+
+
+class AgentAnthropicMixin:
+    """Anthropic Messages API request helpers."""
+
+    # Instance attributes set by BaseAgent.__init__ (model, llm_kwargs) and
+    # Agent.__init__ (client). Declared here so the mixin type-checks on its own;
+    # reasoning_config and output_schema are read with getattr because they are
+    # optional on the concrete agent.
+    model: str
+    client: Any
+    llm_kwargs: dict[str, Any]
+
+    def _build_anthropic_request(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list | None = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Assemble the ``(messages, kwargs)`` pair for a Messages API call.
+
+        Shared by the request path and ``count_tokens`` so a token count is
+        taken against exactly the payload that would be sent, not an
+        approximation of it.
+        """
+        call_kwargs = {
+            key: value
+            for key, value in {**self.llm_kwargs, **kwargs}.items()
+            if key not in _ANTHROPIC_EXCLUDED_KWARGS
+        }
+
+        system, remainder = split_system(messages)
+        remainder = merge_tool_results(remainder)
+        remainder = drop_trailing_assistant(remainder)
+
+        # max_tokens is required by the API. Streaming gets a larger default
+        # because a big max_tokens on a non-streaming request risks a timeout.
+        call_kwargs.setdefault(
+            "max_tokens",
+            ANTHROPIC_DEFAULT_MAX_TOKENS_STREAMING if stream else ANTHROPIC_DEFAULT_MAX_TOKENS,
+        )
+
+        strip_rejected_sampling_params(self.model, call_kwargs)
+        apply_reasoning_config(reasoning_for(self, "anthropic"), call_kwargs, self.model)
+
+        anthropic_tools = convert_tools(tools)
+
+        # Caching is on unless anthropic_cache is False/None; it adds nothing
+        # when the developer placed their own cache_control.
+        apply_cache_control(
+            self.llm_kwargs.get("anthropic_cache", True),
+            system,
+            anthropic_tools,
+            remainder,
+            call_kwargs,
+        )
+
+        if anthropic_tools:
+            call_kwargs["tools"] = anthropic_tools
+        if system:
+            call_kwargs["system"] = system
+
+        output_schema = getattr(self, "output_schema", None)
+        if output_schema is not None:
+            call_kwargs.setdefault("output_config", {})
+            call_kwargs["output_config"] = {
+                **call_kwargs["output_config"],
+                "format": _as_json_schema_format(output_schema),
+            }
+
+        return remainder, call_kwargs
+
+    async def _call_anthropic(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list | None = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Call the Anthropic Messages API."""
+        remainder, call_kwargs = self._build_anthropic_request(messages, tools, stream, **kwargs)
+        method = self.client.messages.stream if stream else self.client.messages.create
+        call_kwargs = filter_kwargs(call_kwargs, accepted_params(method), "anthropic")
+
+        if stream:
+            logger.debug("Calling Anthropic messages.stream with model=%s", self.model)
+            return self.client.messages.stream(
+                model=self.model,
+                messages=remainder,
+                **call_kwargs,
+            )
+
+        logger.debug("Calling Anthropic messages.create with model=%s", self.model)
+        response = await self.client.messages.create(
+            model=self.model,
+            messages=remainder,
+            **call_kwargs,
+        )
+
+        usage = getattr(response, "usage", None)
+        cached = getattr(usage, "cache_read_input_tokens", 0) or 0
+        if cached:
+            logger.debug("Cache hit: %d cached tokens (Anthropic messages)", cached)
+
+        if getattr(response, "stop_reason", None) == "pause_turn":
+            logger.info(
+                "Anthropic returned stop_reason='pause_turn' (server-tool "
+                "iteration limit). Re-send the conversation including this "
+                "response to resume."
+            )
+        return response
+
+    async def _count_tokens_anthropic(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list | None = None,
+        **kwargs: Any,
+    ) -> int:
+        """Count input tokens for a request via ``messages.count_tokens``.
+
+        Counted against the exact payload ``_call_anthropic`` would send, so the
+        number reflects the real system prompt, tool schemas, and merged tool
+        results rather than an estimate.
+        """
+        remainder, call_kwargs = self._build_anthropic_request(
+            messages, tools, stream=False, **kwargs
+        )
+
+        # The framework adds these for generation; count_tokens has no such parameters.
+        for key in ("max_tokens", "stream"):
+            call_kwargs.pop(key, None)
+        call_kwargs = filter_kwargs(
+            call_kwargs, accepted_params(self.client.messages.count_tokens), "anthropic"
+        )
+
+        response = await self.client.messages.count_tokens(
+            model=self.model,
+            messages=remainder,
+            **call_kwargs,
+        )
+        return getattr(response, "input_tokens", 0) or 0
+
+
+def _as_json_schema_format(output_schema: Any) -> dict[str, Any]:
+    """Render an output schema into Anthropic's ``output_config.format`` shape."""
+    if isinstance(output_schema, dict):
+        return output_schema
+
+    # Pydantic model
+    schema_fn = getattr(output_schema, "model_json_schema", None)
+    if callable(schema_fn):
+        return {
+            "type": "json_schema",
+            "schema": schema_fn(),
+            "name": getattr(output_schema, "__name__", "output"),
+        }
+
+    return {"type": "json_schema", "schema": {}}

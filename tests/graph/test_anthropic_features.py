@@ -1,0 +1,274 @@
+"""Tests for prompt caching, count_tokens, and server tools."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from tenxgraph.core.graph.agent_internal.anthropic import AgentAnthropicMixin
+from tenxgraph.core.graph.agent_internal.anthropic_request import (
+    apply_cache_control,
+    strip_bedrock_prefix,
+)
+from tenxgraph.core.graph.agent_internal.anthropic_server_tools import (
+    CODE_EXECUTION,
+    WEB_FETCH_BASIC,
+    WEB_FETCH_DYNAMIC,
+    WEB_SEARCH_BASIC,
+    WEB_SEARCH_DYNAMIC,
+    code_execution_tool,
+    is_server_tool,
+    web_fetch_tool,
+    web_search_tool,
+)
+
+
+class TestStripBedrockPrefix:
+    def test_prefix_removed_for_lookup(self):
+        assert strip_bedrock_prefix("anthropic.claude-opus-5") == "claude-opus-5"
+
+    def test_bare_id_unchanged(self):
+        assert strip_bedrock_prefix("claude-opus-5") == "claude-opus-5"
+
+
+class TestDynamicFilterIdForms:
+    @pytest.mark.parametrize(
+        "model",
+        ["claude-opus-4-7", "us.anthropic.claude-opus-4-7", "claude-opus-4-7@20260101"],
+    )
+    def test_id_forms_get_dynamic_tools(self, model):
+        assert web_search_tool(model)["type"] == WEB_SEARCH_DYNAMIC
+
+
+class TestCacheControl:
+    E = {"type": "ephemeral"}
+
+    def test_none_and_false_are_a_noop(self):
+        for off in (None, False):
+            system, kwargs = [{"type": "text", "text": "sys"}], {}
+            apply_cache_control(off, system, None, [], kwargs)
+            assert "cache_control" not in system[0]
+            assert kwargs == {}
+
+    def test_true_marks_last_system_block_and_top_level(self):
+        system, kwargs = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], {}
+        apply_cache_control(True, system, None, [], kwargs)
+        assert "cache_control" not in system[0]
+        assert system[1]["cache_control"] == self.E
+        assert kwargs["cache_control"] == self.E
+
+    def test_dict_ttl_used_on_both(self):
+        control = {"type": "ephemeral", "ttl": "1h"}
+        system, kwargs = [{"type": "text", "text": "sys"}], {}
+        apply_cache_control(control, system, None, [], kwargs)
+        assert system[0]["cache_control"] == control
+        assert kwargs["cache_control"] == control
+
+    def test_tools_only_marks_last_tool(self):
+        tools, kwargs = [{"name": "a"}, {"name": "b"}], {}
+        apply_cache_control(True, None, tools, [], kwargs)
+        assert "cache_control" not in tools[0]
+        assert tools[1]["cache_control"] == self.E
+        assert kwargs["cache_control"] == self.E
+
+    def test_system_wins_over_tools_for_the_marker(self):
+        system, tools = [{"type": "text", "text": "s"}], [{"name": "a"}]
+        apply_cache_control(True, system, tools, [], {})
+        assert "cache_control" not in tools[0]
+        assert system[0]["cache_control"] == self.E
+
+    def test_no_system_and_no_tools_only_sets_top_level(self):
+        kwargs = {}
+        apply_cache_control(True, None, None, [], kwargs)
+        assert kwargs["cache_control"] == self.E
+
+    def test_developer_top_level_adds_nothing(self):
+        system = [{"type": "text", "text": "s"}]
+        kwargs = {"cache_control": {"type": "ephemeral", "ttl": "1h"}}
+        apply_cache_control(True, system, None, [], kwargs)
+        assert "cache_control" not in system[0]
+        assert kwargs == {"cache_control": {"type": "ephemeral", "ttl": "1h"}}
+
+    def test_developer_system_marker_adds_nothing(self):
+        system = [
+            {"type": "text", "text": "a", "cache_control": self.E},
+            {"type": "text", "text": "b"},
+        ]
+        kwargs = {}
+        apply_cache_control(True, system, None, [], kwargs)
+        assert "cache_control" not in system[1]
+        assert kwargs == {}
+
+    def test_developer_tool_or_message_marker_adds_nothing(self):
+        tools = [{"name": "a", "cache_control": self.E}]
+        system, kwargs = [{"type": "text", "text": "s"}], {}
+        apply_cache_control(True, system, tools, [], kwargs)
+        assert "cache_control" not in system[0] and kwargs == {}
+
+        block = {"type": "text", "text": "x", "cache_control": self.E}
+        msgs = [{"role": "user", "content": [block]}]
+        system, kwargs = [{"type": "text", "text": "s"}], {}
+        apply_cache_control(True, system, None, msgs, kwargs)
+        assert "cache_control" not in system[0] and kwargs == {}
+
+
+class _StubAgent(AgentAnthropicMixin):
+    def __init__(self, **overrides):
+        self.model = overrides.get("model", "claude-opus-5")
+        self.llm_kwargs = overrides.get("llm_kwargs", {})
+        self.reasoning_config = overrides.get("reasoning_config")
+        self.output_schema = overrides.get("output_schema")
+        self.client = MagicMock()
+        self.client.messages.create = AsyncMock(
+            return_value=SimpleNamespace(usage=None, stop_reason="end_turn")
+        )
+        self.client.messages.count_tokens = AsyncMock(
+            return_value=SimpleNamespace(input_tokens=1234)
+        )
+
+
+class TestCachingInRequest:
+    @pytest.mark.asyncio
+    async def test_cache_flag_reaches_the_system_block(self):
+        agent = _StubAgent(llm_kwargs={"anthropic_cache": True})
+        await agent._call_anthropic(
+            [{"role": "system", "content": "big prompt"}, {"role": "user", "content": "hi"}]
+        )
+        system = agent.client.messages.create.call_args.kwargs["system"]
+        kwargs = agent.client.messages.create.call_args.kwargs
+        assert system[-1]["cache_control"] == {"type": "ephemeral"}
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+
+    @pytest.mark.asyncio
+    async def test_cache_is_on_by_default(self):
+        agent = _StubAgent()
+        await agent._call_anthropic(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        )
+        kwargs = agent.client.messages.create.call_args.kwargs
+        assert kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("off", [False, None])
+    async def test_cache_off(self, off):
+        agent = _StubAgent(llm_kwargs={"anthropic_cache": off})
+        await agent._call_anthropic(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        )
+        kwargs = agent.client.messages.create.call_args.kwargs
+        assert "cache_control" not in kwargs
+        assert "cache_control" not in kwargs["system"][-1]
+
+    @pytest.mark.asyncio
+    async def test_anthropic_cache_is_not_sent_as_a_request_param(self):
+        agent = _StubAgent(llm_kwargs={"anthropic_cache": True})
+        await agent._call_anthropic([{"role": "user", "content": "hi"}])
+        assert "anthropic_cache" not in agent.client.messages.create.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_explicit_cache_control_is_not_doubled(self):
+        """A caller placing their own breakpoints owns the strategy."""
+        agent = _StubAgent(
+            llm_kwargs={"anthropic_cache": True, "cache_control": {"type": "ephemeral"}}
+        )
+        await agent._call_anthropic(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+        )
+        system = agent.client.messages.create.call_args.kwargs["system"]
+        assert "cache_control" not in system[-1]
+
+
+class TestCountTokens:
+    @pytest.mark.asyncio
+    async def test_returns_input_tokens(self):
+        agent = _StubAgent()
+        assert await agent._count_tokens_anthropic([{"role": "user", "content": "hi"}]) == 1234
+
+    @pytest.mark.asyncio
+    async def test_generation_params_are_not_sent(self):
+        """count_tokens prices the input; it has no max_tokens or stream parameter."""
+        agent = _StubAgent(llm_kwargs={"max_tokens": 500}, reasoning_config={"effort": "high"})
+        await agent._count_tokens_anthropic([{"role": "user", "content": "hi"}])
+        kwargs = agent.client.messages.count_tokens.call_args.kwargs
+        for rejected in ("max_tokens", "stream", "temperature"):
+            assert rejected not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_counts_against_the_real_payload(self):
+        """System prompt and tools are part of the counted input."""
+        agent = _StubAgent(llm_kwargs={"anthropic_cache": False})
+        await agent._count_tokens_anthropic(
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "f", "description": "d"}}],
+        )
+        kwargs = agent.client.messages.count_tokens.call_args.kwargs
+        assert kwargs["system"] == [{"type": "text", "text": "sys"}]
+        assert kwargs["tools"][0]["name"] == "f"
+
+    @pytest.mark.asyncio
+    async def test_missing_input_tokens_returns_zero(self):
+        agent = _StubAgent()
+        agent.client.messages.count_tokens = AsyncMock(return_value=SimpleNamespace())
+        assert await agent._count_tokens_anthropic([]) == 0
+
+
+class TestServerTools:
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("claude-opus-5", WEB_SEARCH_DYNAMIC),
+            ("claude-sonnet-5", WEB_SEARCH_DYNAMIC),
+            ("claude-haiku-4-5", WEB_SEARCH_BASIC),
+            ("anthropic.claude-opus-5", WEB_SEARCH_DYNAMIC),
+        ],
+    )
+    def test_web_search_variant_is_model_gated(self, model, expected):
+        assert web_search_tool(model)["type"] == expected
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("claude-opus-5", WEB_FETCH_DYNAMIC),
+            ("claude-haiku-4-5", WEB_FETCH_BASIC),
+        ],
+    )
+    def test_web_fetch_variant_is_model_gated(self, model, expected):
+        assert web_fetch_tool(model)["type"] == expected
+
+    def test_optional_params_only_included_when_set(self):
+        tool = web_search_tool("claude-opus-5")
+        assert set(tool) == {"type", "name"}
+
+    def test_domain_filters_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="never both"):
+            web_search_tool("claude-opus-5", allowed_domains=["a.test"], blocked_domains=["b.test"])
+
+    def test_web_fetch_domain_filters_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="never both"):
+            web_fetch_tool("claude-opus-5", allowed_domains=["a.test"], blocked_domains=["b.test"])
+
+    def test_code_execution_tool_shape(self):
+        assert code_execution_tool() == {"type": CODE_EXECUTION, "name": "code_execution"}
+
+    @pytest.mark.parametrize(
+        ("tool", "expected"),
+        [
+            ({"type": WEB_SEARCH_DYNAMIC, "name": "web_search"}, True),
+            ({"type": CODE_EXECUTION, "name": "code_execution"}, True),
+            ({"type": "function", "function": {"name": "f"}}, False),
+            ("not a dict", False),
+        ],
+    )
+    def test_is_server_tool(self, tool, expected):
+        assert is_server_tool(tool) is expected
+
+    @pytest.mark.asyncio
+    async def test_server_tools_pass_through_conversion_unmangled(self):
+        agent = _StubAgent(llm_kwargs={"anthropic_cache": False})
+        search = web_search_tool("claude-opus-5", max_uses=3)
+        await agent._call_anthropic([{"role": "user", "content": "hi"}], tools=[search])
+        assert agent.client.messages.create.call_args.kwargs["tools"] == [search]
+

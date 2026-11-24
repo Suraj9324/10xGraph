@@ -1,0 +1,286 @@
+"""Caller identity carried in ``config["user"]``, and the helpers storage uses to scope data.
+
+``config["user"]`` holds an :class:`Identity` or a dict that validates into one (direct SDK
+callers keep passing a dict). The API builds it from a verified token; a developer's own code
+is the trust boundary for direct calls. With no identity there are no checks and each storage
+backend applies its own default.
+
+Reach says which rows a caller may see:
+
+- ``own``: rows of this ``user_id`` (and this caller's tenant values).
+- ``tenant``: rows of every user with the same tenant values.
+- ``all``: every row.
+
+A missing tenant value, a tenant reach on a backend without tenant columns, or an unknown reach
+raises. Nothing ever widens silently.
+
+``config["credential"]`` holds the caller's raw credential as a :class:`UserCredential`, for
+calling other services as that user (local tools, ``ToolNode(mcp_auth=...)``). It stays inside
+the run: every copy of the config that leaves it (events, callbacks, logs) goes through
+:func:`public_config`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator, Sequence
+from enum import StrEnum
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, SecretStr, StringConstraints
+
+
+CREDENTIAL_KEY = "credential"
+
+
+class Reach(StrEnum):
+    """Which rows of a storage backend a caller can see."""
+
+    OWN = "own"
+    TENANT = "tenant"
+    ALL = "all"
+
+
+class Identity(BaseModel):
+    """Who is calling and what they may do. Immutable once built.
+
+    ``permissions`` is ``resource:action`` strings; ``*`` allows everything and ``resource:*``
+    every action of that resource. ``None`` means unrestricted (direct SDK, auth off).
+
+    Dict readers keep working: ``identity.get(key)``, ``identity[key]`` and ``key in identity``
+    read the merged view ``{**claims, **tenant, "user_id": user_id}``, so ``user_id`` and
+    tenant values win over raw claims.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Never empty: a blank owner would turn isolation off in backends that skip a falsy id.
+    user_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    kind: Literal["user", "system"] = "user"
+    tenant: dict[str, str] = {}
+    roles: frozenset[str] = frozenset()
+    permissions: frozenset[str] | None = None
+    reach: Reach = Reach.OWN
+    claims: dict[str, Any] = {}
+
+    def can(self, permission: str) -> bool:
+        """Whether ``permission`` (``resource:action``) is allowed."""
+        if self.permissions is None or "*" in self.permissions:
+            return True
+        resource = permission.split(":", 1)[0]
+        return permission in self.permissions or f"{resource}:*" in self.permissions
+
+    def _view(self) -> dict[str, Any]:
+        return {**self.claims, **self.tenant, "user_id": self.user_id}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._view().get(key, default)
+
+    def keys(self) -> Iterator[str]:
+        """Keys of the merged view (lets ``dict(identity)`` and ``{**identity}`` work)."""
+        return iter(self._view())
+
+    def __getitem__(self, key: str) -> Any:
+        return self._view()[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._view()
+
+
+def get_identity(config: Any) -> Identity | None:
+    """The identity in ``config["user"]``, or None when absent.
+
+    A dict is validated into an :class:`Identity`; a malformed one raises, it never becomes
+    None (which would mean "no checks").
+    """
+    user = config.get("user") if isinstance(config, dict) else None
+    if user is None:
+        return None
+    if isinstance(user, Identity):
+        return user
+    return Identity.model_validate(user)
+
+
+class UserCredential:
+    """The caller's raw credential, for calling other services as that user.
+
+    Not a pydantic model, so a ``model_dump`` of something holding it never writes the token.
+    Its repr and str are redacted, ``json.dumps`` and pickling raise, and copies return the
+    same object (run configs get copied). Immutable. Read the token with
+    ``credential.token.get_secret_value()``.
+    """
+
+    __slots__ = ("_scheme", "_token")
+
+    _scheme: str
+    _token: SecretStr
+
+    def __init__(self, token: SecretStr | str, scheme: str = "Bearer") -> None:
+        if isinstance(token, str):
+            token = SecretStr(token)
+        if not isinstance(token, SecretStr) or not token.get_secret_value():
+            raise ValueError("UserCredential needs a non-empty token")
+        if not isinstance(scheme, str) or not scheme or any(c.isspace() for c in scheme):
+            raise ValueError("UserCredential scheme must be one word, such as 'Bearer'")
+        object.__setattr__(self, "_token", token)
+        object.__setattr__(self, "_scheme", scheme)
+
+    @property
+    def token(self) -> SecretStr:
+        return self._token
+
+    @property
+    def scheme(self) -> str:
+        return self._scheme
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("UserCredential is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("UserCredential is immutable")
+
+    def __repr__(self) -> str:
+        return f"UserCredential(scheme={self._scheme!r}, token='**********')"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        raise TypeError("UserCredential cannot be pickled: the token must stay in the run")
+
+    def __reduce__(self) -> Any:
+        raise TypeError("UserCredential cannot be pickled: the token must stay in the run")
+
+    def __copy__(self) -> UserCredential:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> UserCredential:
+        return self
+
+
+def get_credential(config: Any) -> UserCredential | None:
+    """The credential in ``config["credential"]``, or None when absent.
+
+    Raises:
+        TypeError: the value is not a :class:`UserCredential` (a raw string is refused, it
+            would be logged and published like any other config value).
+    """
+    value = config.get(CREDENTIAL_KEY) if isinstance(config, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, UserCredential):
+        raise TypeError(
+            f"config[{CREDENTIAL_KEY!r}] must be a UserCredential, got {type(value).__name__}"
+        )
+    return value
+
+
+def public_config(config: Any) -> dict[str, Any]:
+    """A shallow copy of the run config without the credential.
+
+    Use it wherever config leaves the run: events, callback contexts, logs, storage.
+    """
+    if not isinstance(config, dict):
+        return {}
+    return {k: v for k, v in config.items() if k != CREDENTIAL_KEY}
+
+
+def owner_id(config: Any) -> Any:
+    """The storage owner key: ``Identity.user_id`` when there is an identity, else
+    ``config["user_id"]`` (direct SDK calls). The identity wins when both are set."""
+    identity = get_identity(config)
+    if identity is not None:
+        return identity.user_id
+    return config.get("user_id") if isinstance(config, dict) else None
+
+
+def can(config: Any, permission: str) -> bool:
+    """Whether the caller may do ``permission``. True when there is no identity."""
+    identity = get_identity(config)
+    return True if identity is None else identity.can(permission)
+
+
+def owner_filter(
+    config: Any,
+    tenant_columns: Sequence[str] = (),
+    *,
+    owner: str | None = None,
+    reach: Reach | None = None,
+) -> dict[str, str] | None:
+    """Column filters a storage query must apply for this caller.
+
+    Returns None when there is no identity (the backend applies its own default). Otherwise:
+    reach ``own`` gives ``{"user_id": ..., **tenant values}``, ``tenant`` gives the tenant
+    values only, ``all`` gives ``{}`` (no tenant value needed).
+
+    ``owner`` targets shared data owned by a reserved ``__system__:<name>`` id (agent memory,
+    RAG knowledge bases). It pins ``user_id`` to that owner on every reach, so a wider reach
+    never reads other users' rows through a shared-data query.
+
+    ``reach`` replaces the identity's reach for this call. Writes pass ``Reach.OWN``: reach
+    ``tenant`` and ``all`` widen reads, lists and deletes only, never writes.
+
+    Raises:
+        ValueError: a tenant column has no value in ``Identity.tenant``, or reach is
+            ``tenant`` and the backend has no tenant columns.
+    """
+    identity = get_identity(config)
+    if identity is None:
+        return None
+    reach = reach or identity.reach
+    if reach is Reach.ALL and owner is None:
+        return {}
+    tenant = _tenant_values(identity, tenant_columns)
+    if owner is not None:
+        return {"user_id": owner, **tenant}
+    if reach is Reach.TENANT:
+        if not tenant_columns:
+            raise ValueError(
+                "reach 'tenant' needs a backend with tenant columns; this backend declares none"
+            )
+        return tenant
+    return {"user_id": identity.user_id, **tenant}
+
+
+def filter_columns(
+    config: Any,
+    tenant_columns: Sequence[str] = (),
+    *,
+    owner: str | None = None,
+    reach: Reach | None = None,
+) -> tuple[str, ...] | None:
+    """Column names of :func:`owner_filter`, or None when there is no identity."""
+    filters = owner_filter(config, tenant_columns, owner=owner, reach=reach)
+    return None if filters is None else tuple(filters)
+
+
+def can_reach(config: Any, user_id: Any, tenant: dict[str, Any] | None = None) -> bool:
+    """Whether the caller's reach covers data owned by ``user_id`` with ``tenant`` values.
+
+    The in-memory form of :func:`owner_filter`, for checks with no storage query behind them
+    (stopping a run). True when there is no identity. ``tenant`` is the owner's tenant values,
+    compared as text: reach ``own`` needs the same user and those values, ``tenant`` needs
+    those values (and at least one, as storage refuses reach ``tenant`` without tenant
+    columns), ``all`` covers everything. A ``None`` value (a row written before the column
+    existed) matches only a caller on reach ``own`` without that value, as storage writes
+    compare a missing value.
+    """
+    identity = get_identity(config)
+    if identity is None or identity.reach is Reach.ALL:
+        return True
+    tenant = tenant or {}
+    for k, v in tenant.items():
+        claim = identity.tenant.get(k)
+        if v is None:
+            if claim is not None or identity.reach is not Reach.OWN:
+                return False
+        elif claim != str(v):
+            return False
+    if identity.reach is Reach.TENANT:
+        return bool(tenant)
+    return str(identity.user_id) == str(user_id)
+
+
+def _tenant_values(identity: Identity, tenant_columns: Sequence[str]) -> dict[str, str]:
+    missing = [c for c in tenant_columns if c not in identity.tenant]
+    if missing:
+        raise ValueError(f"identity has no tenant value for column(s): {', '.join(missing)}")
+    return {c: identity.tenant[c] for c in tenant_columns}

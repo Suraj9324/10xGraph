@@ -1,0 +1,506 @@
+"""
+Tests for QdrantStore implementation.
+"""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from tenxgraph.storage.store.store_schema import MemoryType
+from tenxgraph.storage.store.qdrant_store import QdrantStore
+from tenxgraph.core.state.message import Message
+
+
+class MockEmbeddingService:
+    """Mock embedding service for testing."""
+
+    def __init__(self, dimension: int = 1536):
+        self._dimension = dimension
+
+    async def aembed(self, text: str) -> list[float]:
+        """Return a mock embedding vector."""
+        # Create deterministic mock embeddings based on text
+        hash_value = hash(text)
+        return [float((hash_value + i) % 100) / 100.0 for i in range(self._dimension)]
+
+    def embed(self, text: str) -> list[float]:
+        """Synchronous version for compatibility."""
+        import asyncio
+        return asyncio.run(self.aembed(text))
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+
+@pytest.fixture
+def mock_embedding_service():
+    """Create a mock embedding service."""
+    return MockEmbeddingService()
+
+
+@pytest.fixture
+def mock_qdrant_client():
+    """Create a mock Qdrant client."""
+    client = AsyncMock()
+    client.get_collections.return_value = MagicMock(collections=[])
+    client.create_collection.return_value = None
+    client.upsert.return_value = None
+    client.query_points.return_value = MagicMock(points=[])
+    client.scroll.return_value = ([], None)
+    client.retrieve.return_value = []
+    client.delete.return_value = None
+    return client
+
+
+@pytest.fixture
+def qdrant_store(mock_embedding_service, mock_qdrant_client):
+    """Create a QdrantStore instance with mocked dependencies."""
+    with patch("qdrant_client.AsyncQdrantClient") as mock_client_class:
+        mock_client_class.return_value = mock_qdrant_client
+        store = QdrantStore(
+            embedding=mock_embedding_service,
+            path="./test_data"
+        )
+        return store
+
+
+@pytest.fixture
+def sample_config():
+    """Sample configuration for testing."""
+    return {
+        "user_id": "test_user",
+        "thread_id": "test_thread",
+        "collection": "test_collection"
+    }
+
+
+@pytest.fixture
+def sample_message():
+    """Sample message for testing."""
+    return Message.text_message("Hello, this is a test message", role="user")
+
+
+class TestQdrantStore:
+    """Test QdrantStore functionality."""
+
+
+    @pytest.mark.asyncio
+    async def test_collection_creation(self, qdrant_store, mock_qdrant_client):
+        """Test collection creation when it doesn't exist."""
+        mock_qdrant_client.get_collections.return_value = MagicMock(collections=[])
+        
+        await qdrant_store._ensure_collection_exists("test_collection")
+        
+        mock_qdrant_client.create_collection.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_collection_creation_creates_payload_indexes(self, qdrant_store, mock_qdrant_client):
+        """Test that payload indexes are created for all filterable fields on new collections."""
+        from qdrant_client.http.models import PayloadSchemaType
+
+        mock_qdrant_client.get_collections.return_value = MagicMock(collections=[])
+
+        await qdrant_store._ensure_collection_exists("test_collection")
+
+        expected = {
+            "user_id": PayloadSchemaType.KEYWORD,
+            "memory_type": PayloadSchemaType.KEYWORD,
+            "category": PayloadSchemaType.KEYWORD,
+            "memory_key": PayloadSchemaType.KEYWORD,
+            # aget_all orders by the timestamp (newest first), which needs a range index.
+            "timestamp": PayloadSchemaType.DATETIME,
+        }
+        calls = mock_qdrant_client.create_payload_index.call_args_list
+        assert {c.kwargs["field_name"]: c.kwargs["field_schema"] for c in calls} == expected
+        assert len(calls) == len(expected)
+        for call in calls:
+            assert call.kwargs["collection_name"] == "test_collection"
+
+    @pytest.mark.asyncio
+    async def test_payload_index_failure_is_best_effort(self, qdrant_store, mock_qdrant_client):
+        """Test that individual payload index failures are caught and don't prevent caching."""
+        mock_qdrant_client.get_collections.return_value = MagicMock(collections=[])
+        mock_qdrant_client.create_payload_index.side_effect = Exception("index creation failed")
+
+        # Should NOT raise — individual index failures are best-effort.
+        await qdrant_store._ensure_collection_exists("test_collection")
+
+        # Collection should still be cached.
+        assert "test_collection" in qdrant_store._collection_cache
+        # All 5 fields should have been attempted.
+        assert mock_qdrant_client.create_payload_index.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_existing_collection_ensures_payload_indexes(self, qdrant_store, mock_qdrant_client):
+        """Test that payload indexes are ensured even when the collection already exists."""
+
+        existing = MagicMock()
+        existing.name = "test_collection"
+        mock_qdrant_client.get_collections.return_value = MagicMock(collections=[existing])
+
+        await qdrant_store._ensure_collection_exists("test_collection")
+
+        mock_qdrant_client.create_collection.assert_not_called()
+        # Indexes should still be created (idempotent) for existing collections.
+        expected_fields = ["user_id", "memory_type", "category", "memory_key", "timestamp"]
+        assert mock_qdrant_client.create_payload_index.call_count == len(expected_fields)
+
+        called_fields = [
+            call.kwargs["field_name"]
+            for call in mock_qdrant_client.create_payload_index.call_args_list
+        ]
+        assert called_fields == expected_fields
+
+
+    @pytest.mark.asyncio
+    async def test_aget_all_uses_scroll_with_user_filter(
+        self, qdrant_store, mock_qdrant_client, sample_config
+    ):
+        """Listing scrolls the user's points: no vector, no search call."""
+        record = MagicMock(spec=["id", "payload", "vector"])
+        record.id = "r1"
+        record.vector = None
+        record.payload = {"content": "listed", "user_id": "test_user"}
+        mock_qdrant_client.scroll.return_value = ([record], None)
+
+        results = await qdrant_store.aget_all(config=sample_config, limit=5)
+
+        kwargs = mock_qdrant_client.scroll.call_args.kwargs
+        assert kwargs["limit"] == 5
+        assert [c.key for c in kwargs["scroll_filter"].must] == ["user_id"]
+        assert kwargs["scroll_filter"].must[0].match.value == "test_user"
+        assert "query" not in kwargs and "query_vector" not in kwargs
+        mock_qdrant_client.query_points.assert_not_called()
+        assert [r.content for r in results] == ["listed"]
+        assert results[0].score == 1.0
+
+    @pytest.mark.asyncio
+    async def test_asearch_does_not_filter_by_thread_id(self, qdrant_store, mock_qdrant_client, sample_config):
+        """LTM search is cross-thread; thread_id must NOT be passed to the filter."""
+        mock_qdrant_client.query_points.return_value = MagicMock(points=[])
+
+        with patch.object(qdrant_store, "_build_qdrant_filter", wraps=qdrant_store._build_qdrant_filter) as mock_filter:
+            await qdrant_store.asearch(config=sample_config, query="test")
+            call_kwargs = mock_filter.call_args.kwargs
+            assert "thread_id" not in call_kwargs or call_kwargs.get("thread_id") is None
+
+
+    @staticmethod
+    def _delete_conditions(mock_qdrant_client):
+        selector = mock_qdrant_client.delete.call_args.kwargs["points_selector"]
+        return {c.key: c.match.value for c in selector.filter.must}
+
+    @pytest.mark.asyncio
+    async def test_aforget_memory_without_narrowing_scopes_to_user(
+        self, qdrant_store, mock_qdrant_client
+    ):
+        await qdrant_store.aforget_memory(config={"user_id": "u1"})
+
+        conditions = self._delete_conditions(mock_qdrant_client)
+        assert conditions["user_id"] == "u1"
+        assert set(conditions) <= {"user_id", "thread_id"}
+
+    @pytest.mark.asyncio
+    async def test_aforget_memory_applies_memory_type_category_and_filters(
+        self, qdrant_store, mock_qdrant_client
+    ):
+        await qdrant_store.aforget_memory(
+            config={"user_id": "u1"},
+            memory_type=MemoryType.SEMANTIC,
+            category="travel",
+            filters={"source": "chat", "pinned": False},
+        )
+
+        conditions = self._delete_conditions(mock_qdrant_client)
+        assert conditions["user_id"] == "u1"
+        assert conditions["memory_type"] == MemoryType.SEMANTIC.value
+        assert conditions["category"] == "travel"
+        assert conditions["source"] == "chat"
+        assert conditions["pinned"] is False
+
+    @pytest.mark.asyncio
+    async def test_aforget_memory_accepts_memory_type_string(
+        self, qdrant_store, mock_qdrant_client
+    ):
+        await qdrant_store.aforget_memory(config={"user_id": "u1"}, memory_type="semantic")
+
+        conditions = self._delete_conditions(mock_qdrant_client)
+        assert conditions["memory_type"] == MemoryType.SEMANTIC.value
+
+    @pytest.mark.asyncio
+    async def test_aforget_memory_rejects_unmatchable_filter_without_deleting(
+        self, qdrant_store, mock_qdrant_client
+    ):
+        with pytest.raises(ValueError, match="Unsupported filter"):
+            await qdrant_store.aforget_memory(
+                config={"user_id": "u1"}, filters={"tags": ["a", "b"]}
+            )
+
+        mock_qdrant_client.delete.assert_not_called()
+
+
+    def test_extract_config_values(self, qdrant_store):
+        """Test config value extraction."""
+        config = {
+            "user_id": "user123",
+            "thread_id": "test_thread",
+            "collection": "custom_collection"
+        }
+
+        user_id, thread_id, collection = qdrant_store._extract_config_values(config)
+
+        assert user_id == "user123"
+        assert thread_id == "test_thread"
+        assert collection == "custom_collection"
+
+
+    def test_prepare_content_string(self, qdrant_store):
+        """Test content preparation with string."""
+        text = "Hello world"
+        result = qdrant_store._prepare_content(text)
+        assert result == "Hello world"
+
+    def test_prepare_content_message(self, qdrant_store, sample_message):
+        """Test content preparation with Message."""
+        result = qdrant_store._prepare_content(sample_message)
+        assert isinstance(result, str)
+
+    @pytest.mark.asyncio
+    async def test_point_to_search_result(self, qdrant_store):
+        """Test conversion of Qdrant point to MemorySearchResult."""
+        mock_point = MagicMock()
+        mock_point.id = "test_id"
+        mock_point.score = 0.85
+        mock_point.payload = {
+            "content": "test content",
+            "user_id": "user123",
+            "thread_id": "test_thread",
+            "memory_type": "episodic",
+            "timestamp": "2023-01-01T00:00:00"
+        }
+        
+        result = qdrant_store._point_to_search_result(mock_point)
+        
+        assert result.id == "test_id"
+        assert result.content == "test content"
+        assert result.score == 0.85
+        assert result.user_id == "user123"
+        assert result.thread_id == "test_thread"
+        assert result.memory_type == MemoryType.EPISODIC
+
+    def test_build_qdrant_filter(self, qdrant_store):
+        """Test Qdrant filter building."""
+        filter_obj = qdrant_store._build_qdrant_filter(
+            user_id="user123",
+            thread_id="test_thread",
+            memory_type=MemoryType.EPISODIC,
+            category="test",
+            filters={"custom_field": "custom_value"}
+        )
+        
+        assert filter_obj is not None
+        assert len(filter_obj.must) == 5  # user_id, agent_id, memory_type, category, custom_field
+
+    def test_build_qdrant_filter_empty(self, qdrant_store):
+        """Test Qdrant filter building with no conditions."""
+        filter_obj = qdrant_store._build_qdrant_filter()
+        
+        assert filter_obj is None
+
+
+class TestSyncMethods:
+    """Test synchronous wrapper methods."""
+
+    def test_store_sync(self, qdrant_store, sample_config):
+        """Test synchronous store method."""
+        with patch.object(qdrant_store, 'astore') as mock_astore:
+            mock_astore.return_value = "test_id"
+            
+            result = qdrant_store.store(
+                config=sample_config,
+                content="test content"
+            )
+            
+            assert result == "test_id"
+            mock_astore.assert_called_once()
+
+    def test_search_sync(self, qdrant_store, sample_config):
+        """Test synchronous search method."""
+        with patch.object(qdrant_store, 'asearch') as mock_asearch:
+            mock_asearch.return_value = []
+            
+            result = qdrant_store.search(
+                config=sample_config,
+                query="test query"
+            )
+            
+            assert result == []
+            mock_asearch.assert_called_once()
+
+    def test_get_sync(self, qdrant_store, sample_config):
+        """Test synchronous get method."""
+        with patch.object(qdrant_store, 'aget') as mock_aget:
+            mock_aget.return_value = None
+            
+            result = qdrant_store.get(
+                config=sample_config,
+                memory_id="test_id"
+            )
+            
+            assert result is None
+            mock_aget.assert_called_once()
+
+    def test_update_sync(self, qdrant_store, sample_config):
+        """Test synchronous update method."""
+        with patch.object(qdrant_store, 'aupdate') as mock_aupdate:
+            mock_aupdate.return_value = None
+            
+            qdrant_store.update(
+                config=sample_config,
+                memory_id="test_id",
+                content="new content"
+            )
+            
+            mock_aupdate.assert_called_once()
+
+    def test_delete_sync(self, qdrant_store, sample_config):
+        """Test synchronous delete method."""
+        with patch.object(qdrant_store, 'adelete') as mock_adelete:
+            mock_adelete.return_value = None
+            
+            qdrant_store.delete(
+                config=sample_config,
+                memory_id="test_id"
+            )
+            
+            mock_adelete.assert_called_once()
+
+    def test_forget_memory_sync(self, qdrant_store, sample_config):
+        """Test synchronous forget_memory method."""
+        with patch.object(qdrant_store, 'aforget_memory') as mock_aforget:
+            mock_aforget.return_value = None
+            
+            qdrant_store.forget_memory(config=sample_config)
+            
+            mock_aforget.assert_called_once()
+
+
+class TestConvenienceFunctions:
+    """Test convenience factory functions."""
+
+    def test_create_local_qdrant_store(self, mock_embedding_service):
+        """Test local store creation."""
+        with patch("qdrant_client.AsyncQdrantClient"):
+            from tenxgraph.storage.store.qdrant_store import create_local_qdrant_store
+            
+            store = create_local_qdrant_store(
+                path="./test_data",
+                embedding=mock_embedding_service
+            )
+            
+            assert isinstance(store, QdrantStore)
+
+    def test_create_remote_qdrant_store(self, mock_embedding_service):
+        """Test remote store creation."""
+        with patch("qdrant_client.AsyncQdrantClient"):
+            from tenxgraph.storage.store.qdrant_store import create_remote_qdrant_store
+            
+            store = create_remote_qdrant_store(
+                host="localhost",
+                port=6333,
+                embedding=mock_embedding_service
+            )
+            
+            assert isinstance(store, QdrantStore)
+
+    def test_create_cloud_qdrant_store(self, mock_embedding_service):
+        """Test cloud store creation."""
+        with patch("qdrant_client.AsyncQdrantClient"):
+            from tenxgraph.storage.store.qdrant_store import create_cloud_qdrant_store
+            
+            store = create_cloud_qdrant_store(
+                url="https://test.qdrant.io",
+                api_key="test-key",
+                embedding=mock_embedding_service
+            )
+            
+            assert isinstance(store, QdrantStore)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
+
+class _FixedEmbedding:
+    """Maps a text to a fixed 4-d vector so similarity is predictable."""
+
+    dimension = 4
+    _vectors = {"alpha": [1.0, 0.0, 0.0, 0.0], "beta": [0.0, 1.0, 0.0, 0.0]}
+
+    async def aembed(self, text: str) -> list[float]:
+        return self._vectors.get(text, [0.0, 0.0, 1.0, 0.0])
+
+
+class TestQdrantLocalModeEndToEnd:
+    """Runs asearch and aget_all against the real client API in local (in-memory) mode."""
+
+    @pytest.mark.asyncio
+    async def test_asearch_and_aget_all(self):
+        store = QdrantStore(embedding=_FixedEmbedding(), path=":memory:")
+        mine = {"user_id": "alice", "thread_id": "t1"}
+        other = {"user_id": "bob", "thread_id": "t2"}
+        try:
+            await store.astore(mine, "alpha")
+            await store.astore(mine, "beta")
+            await store.astore(other, "alpha")
+
+            found = await store.asearch(mine, "alpha", limit=5)
+            assert found[0].content == "alpha"
+            assert found[0].score > 0.99
+            assert {r.user_id for r in found} == {"alice"}
+
+            above = await store.asearch(mine, "alpha", limit=5, score_threshold=0.5)
+            assert [r.content for r in above] == ["alpha"]
+
+            listed = await store.aget_all(mine, limit=10)
+            assert sorted(r.content for r in listed) == ["alpha", "beta"]
+            assert {r.user_id for r in listed} == {"alice"}
+        finally:
+            await store.client.close()
+
+    @pytest.mark.asyncio
+    async def test_user_memory_tool_key_upsert_and_forget(self):
+        """Strategy-1 key upsert and forget by key (exact match) on a real Qdrant client."""
+        from tenxgraph.prebuilt.tools.memory import make_user_memory_tool
+        from tenxgraph.storage.store.memory_config import MemoryConfig, UserMemoryConfig
+        from tenxgraph.utils.background_task_manager import BackgroundTaskManager
+
+        store = QdrantStore(embedding=_FixedEmbedding(), path=":memory:")
+        manager = BackgroundTaskManager()
+        tool_fn = make_user_memory_tool(MemoryConfig(user_memory=UserMemoryConfig()))
+        cfg = {"user_id": "alice", "thread_id": "t1"}
+
+        async def call(**kwargs):
+            await tool_fn(store=store, task_manager=manager, config=cfg, **kwargs)
+            await manager.wait_for_all()
+
+        try:
+            await call(action="remember", text="uses vim", memory_key="editor")
+            await call(action="remember", text="uses helix", memory_key="editor")
+            await call(action="remember", text="beta", memory_key="drink")
+            await store.astore({"user_id": "bob"}, "uses vim", metadata={"memory_key": "editor"})
+            listed = await store.aget_all(cfg, limit=10)
+            assert sorted(r.content for r in listed) == ["beta", "uses helix"]
+
+            await call(action="forget", memory_key="editor")
+
+            assert [r.content for r in await store.aget_all(cfg, limit=10)] == ["beta"]
+            assert len(await store.aget_all({"user_id": "bob"}, limit=10)) == 1
+        finally:
+            await store.client.close()
+
+
+class TestIntegerZeroIds:
+
+    def test_none_user_id_adds_no_filter(self, qdrant_store):
+        assert qdrant_store._build_qdrant_filter(user_id=None) is None

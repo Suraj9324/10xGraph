@@ -1,0 +1,174 @@
+"""
+Base class for all LLM-as-judge criteria.
+
+All five LLM criteria (llm_judge, hallucination, factual_accuracy, safety, rubric)
+follow the same pattern:
+
+  1. Optional early-return guard (no response, no rubrics, …)
+  2. Build a prompt from the execution result and expected case
+  3. Call the LLM num_samples times, collect scores + extras per sample
+  4. Average scores, aggregate extras
+  5. Return CriterionResult with structured details
+
+TemplatedLLMCriterion encodes that skeleton once.  Subclasses only need to
+implement _build_prompt() and optionally override the hooks below.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any
+
+from tenxgraph.qa.evaluation.criteria.base import BaseCriterion
+from tenxgraph.qa.evaluation.criteria.llm_utils import LLMCallerMixin
+from tenxgraph.qa.evaluation.eval_result import CriterionResult
+from tenxgraph.qa.evaluation.token_usage import TokenUsage
+
+
+if TYPE_CHECKING:
+    from tenxgraph.qa.evaluation.dataset.eval_set import EvalCase
+    from tenxgraph.qa.evaluation.execution.result import ExecutionResult
+
+logger = logging.getLogger("tenxgraph.evaluation")
+
+
+class TemplatedLLMCriterion(LLMCallerMixin, BaseCriterion):
+    """Base for LLM criteria that follow the sample-and-average pattern.
+
+    Subclasses must implement:
+        _build_prompt(actual, expected) -> str
+
+    Subclasses may override any of the hooks below to customise behaviour
+    without rewriting the entire evaluate() loop.
+    """
+
+    # Optional class settings the default hooks below read:
+    # ``_verdict_key`` adds ``{key: final_score >= threshold}`` to the details, and
+    # ``_list_key`` collects that list field from each sample and merges the unique items.
+    _verdict_key: str | None = None
+    _list_key: str | None = None
+
+    # ------------------------------------------------------------------
+    # Hooks — override in subclasses as needed
+    # ------------------------------------------------------------------
+
+    def _get_skip_result(
+        self,
+        actual: ExecutionResult,
+        expected: EvalCase,
+    ) -> CriterionResult | None:
+        """Return a ready-made result to skip evaluation, or None to proceed.
+
+        Default: skip (score=1.0) when actual_response is empty.
+        """
+        if not actual.actual_response:
+            return self._result(1.0, {"note": "No response to evaluate"})
+        return None
+
+    def _build_prompt(self, actual: ExecutionResult, expected: EvalCase) -> str:
+        raise NotImplementedError(f"{type(self).__name__} must implement _build_prompt()")
+
+    def _collect_extras(self, result_dict: dict[str, Any]) -> dict[str, Any]:
+        """Extract criterion-specific fields from one LLM response dict.
+
+        Default: the ``_list_key`` list when set, else nothing extra.
+        """
+        if self._list_key:
+            return {self._list_key: result_dict.get(self._list_key, [])}
+        return {}
+
+    def _aggregate_extras(self, per_sample: list[dict[str, Any]]) -> dict[str, Any]:
+        """Merge per-sample extras into a single dict for the details block.
+
+        Default: the unique ``_list_key`` items when set, else nothing extra.
+        """
+        if self._list_key:
+            items: list[str] = []
+            for sample in per_sample:
+                items.extend(sample.get(self._list_key, []))
+            return {self._list_key: list(set(items))}
+        return {}
+
+    def _build_details(
+        self,
+        scores: list[float],
+        reasonings: list[str],
+        aggregated_extras: dict[str, Any],
+        final_score: float,
+    ) -> dict[str, Any]:
+        """Build the details dict for the CriterionResult.
+
+        Default: the ``_verdict_key`` flag when set, samples count, reasonings and
+        aggregated extras.
+        """
+        verdict = {self._verdict_key: final_score >= self.threshold} if self._verdict_key else {}
+        return {
+            **verdict,
+            "samples": len(scores),
+            "reasonings": reasonings,
+            **aggregated_extras,
+        }
+
+    # ------------------------------------------------------------------
+    # Shared sampling loop
+    # ------------------------------------------------------------------
+
+    async def _run_samples(
+        self, prompt: str
+    ) -> tuple[list[float], list[str], list[dict[str, Any]], TokenUsage]:
+        """Call the judge LLM num_samples times.
+
+        Returns:
+            (scores, reasonings, per_sample_extras, total_token_usage)
+        """
+        scores: list[float] = []
+        reasonings: list[str] = []
+        extras: list[dict[str, Any]] = []
+        total_usage = TokenUsage()
+        last_error: Exception | None = None
+
+        for _ in range(self.config.num_samples):
+            try:
+                result, usage = await self._call_llm_json(prompt)
+                scores.append(float(result.get("score", 0.0)))
+                reasonings.append(result.get("reasoning", ""))
+                extras.append(self._collect_extras(result))
+                total_usage = total_usage + usage
+            except Exception as e:
+                logger.warning("%s sample failed: %s", self.name, e)
+                last_error = e
+
+        if not scores and last_error is not None:
+            # Surface the real LLM error; evaluate() turns it into an errored result.
+            raise last_error
+        return scores, reasonings, extras, total_usage
+
+    # ------------------------------------------------------------------
+    # Template evaluate() — shared across all subclasses
+    # ------------------------------------------------------------------
+
+    async def evaluate(
+        self,
+        actual: ExecutionResult,
+        expected: EvalCase,
+    ) -> CriterionResult:
+        try:
+            skip = self._get_skip_result(actual, expected)
+            if skip is not None:
+                return skip
+
+            prompt = self._build_prompt(actual, expected)
+            scores, reasonings, extras, token_usage = await self._run_samples(prompt)
+
+            if not scores:
+                return self._failure("All LLM samples failed")
+
+            final_score = sum(scores) / len(scores)
+            agg = self._aggregate_extras(extras)
+            details = self._build_details(scores, reasonings, agg, final_score)
+
+            return self._result(final_score, details, token_usage)
+
+        except Exception as e:
+            logger.error("%s evaluation failed: %s", self.name, e)
+            return self._failure(str(e))

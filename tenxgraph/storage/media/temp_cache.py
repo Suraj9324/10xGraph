@@ -1,0 +1,255 @@
+"""Temporary external URL adaptation cache.
+
+Stores media fetched from external URLs as temporary cached entries with
+TTL-based cleanup. These entries are **not** durable user assets — they
+exist only to adapt external URLs for providers that cannot consume them
+directly.
+
+Default retention: 24 hours (hardcoded for v1).
+
+Deprecated: nothing writes this cache since ``fetch_and_cache`` was removed before 1.0.
+Importing the module emits a ``DeprecationWarning``; it is removed in 2.0.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import warnings
+from typing import Any
+
+from pydantic import BaseModel
+
+
+logger = logging.getLogger("tenxgraph.media.temp_cache")
+
+warnings.warn(
+    "tenxgraph.storage.media.temp_cache is deprecated and will be removed in 2.0: nothing "
+    "writes this cache since fetch_and_cache was removed.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+# Default TTL for temporary cached media (24 hours)
+DEFAULT_TTL_SECONDS = 24 * 60 * 60
+CLEANUP_GRACE_SECONDS = 7 * 24 * 60 * 60  # keep the record past expiry so cleanup() can find it
+
+# Namespace prefix for temporary cache entries in the checkpointer
+TEMP_CACHE_NAMESPACE = "media:temp"
+
+
+class TempCacheEntry(BaseModel):
+    """Metadata for a single temporary cache entry."""
+
+    content_hash: str
+    source_url: str
+    mime_type: str
+    storage_key: str
+    created_at: float
+    expires_at: float
+    is_temporary: bool = True
+
+    @property
+    def is_expired(self) -> bool:
+        """Return True if this entry has passed its expiry time."""
+        return time.time() > self.expires_at
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-compatible dict."""
+        return {
+            "content_hash": self.content_hash,
+            "source_url": self.source_url,
+            "mime_type": self.mime_type,
+            "storage_key": self.storage_key,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "is_temporary": self.is_temporary,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TempCacheEntry:
+        """Deserialize from a JSON-compatible dict."""
+        return cls(
+            content_hash=data["content_hash"],
+            source_url=data["source_url"],
+            mime_type=data["mime_type"],
+            storage_key=data["storage_key"],
+            created_at=data["created_at"],
+            expires_at=data["expires_at"],
+            is_temporary=data.get("is_temporary", True),
+        )
+
+
+class TemporaryMediaCache:
+    """Manages temporary media cache entries with TTL cleanup.
+
+    This cache stores metadata about temporarily fetched external media.
+    The actual media bytes live in the ``BaseMediaStore``; this class
+    only tracks the index/metadata and coordinates cleanup.
+
+    Args:
+        ttl_seconds: Time-to-live for cached entries (default: 24 hours).
+    """
+
+    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> None:
+        self.ttl_seconds = ttl_seconds
+        # In-memory index for fast lookups (populated from checkpointer on first use)
+        self._index: dict[str, TempCacheEntry] = {}
+        self._loaded = False
+
+    async def _ensure_loaded(self, checkpointer: Any) -> None:
+        """Lazy-load the index from the checkpointer."""
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            keys = await checkpointer.alist_cache_keys(TEMP_CACHE_NAMESPACE)
+            for key in keys:
+                data = await checkpointer.aget_cache_value(TEMP_CACHE_NAMESPACE, key)
+                if data is not None:
+                    # Expired entries are kept: cleanup() needs them to delete their blobs.
+                    self._index[key] = TempCacheEntry.from_dict(data)
+        except Exception:
+            logger.debug("Failed to load temp cache index from checkpointer")
+
+    async def store(
+        self,
+        checkpointer: Any,
+        source_url: str,
+        mime_type: str,
+        storage_key: str,
+        content_hash: str | None = None,
+        cache_key: str | None = None,
+    ) -> TempCacheEntry:
+        """Store a new temporary cache entry.
+
+        Args:
+            checkpointer: The checkpointer backend for persistence.
+            source_url: The original external URL.
+            mime_type: MIME type of the media.
+            storage_key: Key in the media store where bytes are stored.
+            content_hash: Optional content hash (computed if not provided).
+
+        Returns:
+            The stored ``TempCacheEntry``.
+        """
+        now = time.time()
+        entry = TempCacheEntry(
+            content_hash=content_hash or "",
+            source_url=source_url,
+            mime_type=mime_type,
+            storage_key=storage_key,
+            created_at=now,
+            expires_at=now + self.ttl_seconds,
+        )
+
+        # Use cache_key if provided (for content-hash dedup), otherwise storage_key
+        index_key = cache_key or storage_key
+
+        await checkpointer.aput_cache_value(
+            TEMP_CACHE_NAMESPACE,
+            index_key,
+            entry.to_dict(),
+            ttl_seconds=self.ttl_seconds + CLEANUP_GRACE_SECONDS,
+        )
+        self._index[index_key] = entry
+        logger.debug(
+            "Stored temp cache entry: url=%s, key=%s, ttl=%ds",
+            source_url,
+            index_key,
+            self.ttl_seconds,
+        )
+        return entry
+
+    async def get(
+        self,
+        checkpointer: Any,
+        storage_key: str,
+    ) -> TempCacheEntry | None:
+        """Retrieve a cache entry by storage key.
+
+        Returns None if the entry does not exist or has expired.
+        """
+        await self._ensure_loaded(checkpointer)
+
+        # Check in-memory index first
+        entry = self._index.get(storage_key)
+        if entry is not None:
+            if entry.is_expired:
+                await self._remove(checkpointer, storage_key)
+                return None
+            return entry
+
+        # Fallback to checkpointer
+        data = await checkpointer.aget_cache_value(TEMP_CACHE_NAMESPACE, storage_key)
+        if data is None:
+            return None
+
+        entry = TempCacheEntry.from_dict(data)
+        if entry.is_expired:
+            await self._remove(checkpointer, storage_key)
+            return None
+
+        self._index[storage_key] = entry
+        return entry
+
+    async def list_expired(self, checkpointer: Any) -> list[TempCacheEntry]:
+        """Return all expired cache entries."""
+        await self._ensure_loaded(checkpointer)
+        return [e for e in self._index.values() if e.is_expired]
+
+    async def cleanup(
+        self,
+        checkpointer: Any,
+        media_store: Any,
+    ) -> int:
+        """Remove expired entries from the cache and delete stored media.
+
+        Args:
+            checkpointer: The checkpointer backend.
+            media_store: The media store to delete bytes from.
+
+        Returns:
+            Number of entries cleaned up.
+        """
+        await self.list_expired(checkpointer)
+        count = 0
+
+        for key, entry in list(self._index.items()):
+            if not entry.is_expired:
+                continue
+
+            # Best-effort: delete media from store
+            try:
+                if media_store is not None:
+                    await media_store.delete(entry.storage_key)
+            except Exception:
+                logger.debug(
+                    "Failed to delete temp media key=%s (may already be gone)",
+                    entry.storage_key,
+                )
+
+            # Remove from index (keyed by cache_key, not storage_key)
+            self._index.pop(key, None)
+
+            # Remove from checkpointer
+            try:
+                await checkpointer.aclear_cache_value(TEMP_CACHE_NAMESPACE, key)
+                count += 1
+            except Exception:
+                logger.debug(
+                    "Failed to clear temp cache entry key=%s",
+                    key,
+                )
+
+        if count:
+            logger.info("Cleaned up %d expired temporary cache entries", count)
+        return count
+
+    async def _remove(self, checkpointer: Any, storage_key: str) -> None:
+        """Remove a single entry from index and checkpointer."""
+        self._index.pop(storage_key, None)
+        try:
+            await checkpointer.aclear_cache_value(TEMP_CACHE_NAMESPACE, storage_key)
+        except Exception:
+            logger.debug("Failed to remove temp cache entry key=%s", storage_key)

@@ -1,0 +1,476 @@
+"""
+Simplified Async-First Base Store for TAF Framework
+
+This module provides a clean, modern interface for memory stores with:
+- Async-first design for better performance
+- Core CRUD operations only
+- Message-specific convenience methods
+- Extensible for different backends (vector stores, managed services, etc.)
+"""
+
+import logging
+from abc import ABC, abstractmethod
+from typing import Any
+
+from tenxgraph.core.authz import filter_columns, owner_id
+from tenxgraph.core.state import Message
+from tenxgraph.core.state.message import generate_id
+from tenxgraph.utils import run_coroutine
+from tenxgraph.utils.validators import has_unstorable_text
+
+from .store_schema import DistanceMetric, MemorySearchResult, MemoryType, RetrievalStrategy
+
+
+logger = logging.getLogger("tenxgraph.store")
+
+# Reserved prefix for owners of shared, ownerless data (agent/app memory, RAG knowledge bases).
+#
+# Stores refuse an empty `user_id`, so data that belongs to no person is written and read under
+# `system_user_id(name)`. Each name is its own owner, so shared data sets stay separate. The API
+# refuses any authenticated identity that starts with this prefix, so no real user can act as one.
+SYSTEM_USER_PREFIX = "__system__"
+
+_USER_ID_REQUIRED = (
+    "user_id is required for memory operations; use system_user_id(name) for shared data"
+)
+
+
+def limit_to_token_budget(
+    results: list[MemorySearchResult], max_tokens: int | None
+) -> list[MemorySearchResult]:
+    """Keep leading results whose summed content fits ``max_tokens`` (about 4 characters each).
+
+    The first result is always kept, so a single large memory is not dropped to nothing.
+    ``None`` or a non-positive budget means no limit.
+    """
+    if not max_tokens or max_tokens <= 0:
+        return results
+    kept: list[MemorySearchResult] = []
+    used = 0
+    for item in results:
+        cost = len(item.content or "") // 4 + 1
+        if kept and used + cost > max_tokens:
+            break
+        kept.append(item)
+        used += cost
+    return kept
+
+
+# (store class, strategy) pairs already warned about in this process.
+_WARNED_STRATEGIES: set[tuple[type, RetrievalStrategy]] = set()
+
+
+def warn_unsupported_strategy(store: Any, strategy: RetrievalStrategy | str | None) -> None:
+    """Log one warning per (store class, strategy) when the store cannot run ``strategy``.
+
+    Only checked when the store declares ``supported_retrieval_strategies``. Never raises; the
+    store still raises ``ValueError`` on the search itself.
+    """
+    supported = getattr(store, "supported_retrieval_strategies", None)
+    if strategy is None or supported is None:
+        return
+    strategy = RetrievalStrategy(strategy)
+    key = (type(store), strategy)
+    if strategy in supported or key in _WARNED_STRATEGIES:
+        return
+    _WARNED_STRATEGIES.add(key)
+    names = ", ".join(s.value for s in RetrievalStrategy if s in supported)
+    logger.warning(
+        "MemoryConfig retrieval_strategy '%s' is not supported by %s (supported: %s); every "
+        "memory search will fail. Use created_at filters for time ranges.",
+        strategy.value,
+        type(store).__name__,
+        names,
+    )
+
+
+def system_user_id(name: str) -> str:
+    """Return the reserved owner id ``"__system__:<name>"`` for shared data called ``name``."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("system_user_id name must be a non-empty string")
+    return f"{SYSTEM_USER_PREFIX}:{name.strip()}"
+
+
+def is_system_user_id(user_id: Any) -> bool:
+    """True if ``user_id`` is a string that starts with the reserved ``__system__`` prefix."""
+    return isinstance(user_id, str) and user_id.startswith(SYSTEM_USER_PREFIX)
+
+
+class BaseStore(ABC):
+    """
+    Simplified async-first base class for memory stores in TAF.
+
+    This class provides a clean interface that supports:
+    - Vector stores (Qdrant, Pinecone, Chroma, etc.)
+    - Managed memory services (Zep, etc.)
+    - Graph databases (Neo4j, etc.)
+
+    Key Design Principles:
+    - Async-first for better performance
+    - Core CRUD operations only
+    - User and agent-centric operations
+    - Extensible filtering and metadata
+    """
+
+    #: True when ``astore(..., memory_key=key)`` is one atomic upsert on the key for the owner.
+    #: The memory layer then skips its search-then-update dedup for keyed writes.
+    supports_memory_key_upsert: bool = False
+
+    #: The retrieval strategies ``asearch`` can run. ``None`` means the store does not declare
+    #: them, so a ``MemoryConfig`` strategy is not checked against it.
+    supported_retrieval_strategies: frozenset[RetrievalStrategy] | None = None
+
+    def setup(self) -> Any:
+        """
+        Synchronous setup method for checkpointer.
+
+        Returns:
+            Any: Implementation-defined setup result.
+        """
+        return run_coroutine(self.asetup())
+
+    async def asetup(self) -> Any:
+        """
+        Asynchronous setup method for checkpointer.
+
+        Returns:
+            Any: Implementation-defined setup result.
+        """
+        raise NotImplementedError
+
+    def _extract_config_values(self, config: dict[str, Any]) -> tuple[Any, Any, str]:
+        """Return ``(user_id, thread_id, collection)`` from the config.
+
+        The collection is the config value, else the store default (a name or a function of
+        the config); it must be a non-empty string.
+        """
+        user_id = owner_id(config)
+        thread_id = config.get("thread_id")
+        collection = config.get("collection")
+        if collection is None:
+            collection = getattr(self, "collection", None)
+            if callable(collection):
+                collection = collection(config)
+        if not isinstance(collection, str) or not collection.strip():
+            raise ValueError(f"collection must be a non-empty string, got {collection!r}")
+        return user_id, thread_id, collection
+
+    def _scope_user_id(self, config: dict[str, Any], user_id: str | int | None) -> str | int | None:
+        """Return the user_id to scope memory operations by, honoring the caller's reach.
+
+        - reach ``all`` (no ``user_id`` in the filter columns) -> ``None`` (no user filter).
+        - otherwise (reach ``own`` / ``tenant``, or no identity) -> the given ``user_id``.
+
+        With no identity memory stays scoped by ``user_id``: it is personal, so it stays
+        isolated unless the caller's identity has reach ``all``.
+        """
+        columns = self._filter_columns(config)
+        if columns is not None and "user_id" not in columns:
+            return None
+        return user_id
+
+    def _filter_columns(self, config: dict[str, Any]) -> tuple[str, ...] | None:
+        """The columns the caller's reach filters by, checked against this store's columns.
+
+        ``None`` when there is no identity. Reach ``tenant`` on a store without tenant columns,
+        or a missing tenant value, raises ``ValueError``, so a scope is never silently weakened.
+        """
+        return filter_columns(config, getattr(self, "tenant_column_names", ()))
+
+    @staticmethod
+    def _valid_user_id(user_id: Any) -> bool:
+        """True for a non-empty string (after stripping) or an int."""
+        if isinstance(user_id, bool):
+            return False
+        if isinstance(user_id, int):
+            return True
+        return isinstance(user_id, str) and bool(user_id.strip())
+
+    def _require_user_id(
+        self, config: dict[str, Any], user_id: str | int | None = None
+    ) -> str | int | None:
+        """Return the user_id to filter reads/updates/deletes by, or raise if it is missing.
+
+        ``user_id`` defaults to :func:`owner_id` (the identity's id, else ``config["user_id"]``).
+        A missing, ``None``, empty or blank id
+        raises ``ValueError`` (a store must never fall back to "every user"). The only
+        exception is an identity with reach ``all``, where ``None`` is returned and callers skip
+        the user filter.
+        """
+        if user_id is None:
+            user_id = owner_id(config)
+        if not self._valid_user_id(user_id):
+            columns = self._filter_columns(config)
+            if columns is not None and "user_id" not in columns:
+                return None  # reach "all": no user filter
+            raise ValueError(_USER_ID_REQUIRED)
+        return self._scope_user_id(config, user_id)
+
+    def _require_owner_id(
+        self, config: dict[str, Any], user_id: str | int | None = None
+    ) -> str | int:
+        """Return the concrete user_id a record is written under, or raise if it is missing.
+
+        Used by writes and by ``aforget_memory``. Unlike ``_require_user_id`` this ignores
+        reach ``all``: a stored record always has an owner (use ``system_user_id(name)`` for
+        shared data), and a bulk forget always names whose memories to delete.
+        """
+        if user_id is None:
+            user_id = owner_id(config)
+        if not self._valid_user_id(user_id):
+            raise ValueError(_USER_ID_REQUIRED)
+        return user_id  # type: ignore[return-value]
+
+    @staticmethod
+    def _refuse_unstorable(**values: Any) -> None:
+        """Raise ``ValueError`` when a write value holds NUL or a lone surrogate.
+
+        Called by every write before it touches the backend, so all stores refuse the same
+        text (Postgres cannot store it, and other backends would keep a corrupted copy).
+        Each keyword names the value in the message (``content``, ``metadata``, ...).
+        """
+        for name, value in values.items():
+            if has_unstorable_text(value):
+                raise ValueError(
+                    f"memory {name} contains a NUL character (\\x00) or a lone surrogate, "
+                    "which cannot be stored; remove it before writing"
+                )
+
+    async def generate_framework_id(self) -> str:
+        """Generate a unique ID using the ``BaseIDGenerator`` bound in InjectQ (uuid4 when none)."""
+        return str(generate_id())
+
+    # --- Core Memory Operations ---
+
+    @abstractmethod
+    async def astore(
+        self,
+        config: dict[str, Any],
+        content: str | Message,
+        memory_type: MemoryType = MemoryType.EPISODIC,
+        category: str = "general",
+        metadata: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> str:
+        """
+        Add a new memory.
+
+        Args:
+            content: The memory content
+            user_id: User identifier
+            agent_id: Agent identifier
+            memory_type: Type of memory (episodic, semantic, etc.)
+            category: Memory category for organization
+            metadata: Additional metadata
+            **kwargs: Store-specific parameters
+
+        Returns:
+            Memory ID
+        """
+        raise NotImplementedError
+
+    # --- Sync wrappers ---
+    def store(
+        self,
+        config: dict[str, Any],
+        content: str | Message,
+        memory_type: MemoryType = MemoryType.EPISODIC,
+        category: str = "general",
+        metadata: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> str:
+        """Synchronous wrapper for `astore` that runs the async implementation."""
+        return run_coroutine(
+            self.astore(
+                config,
+                content,
+                memory_type=memory_type,
+                category=category,
+                metadata=metadata,
+                **kwargs,
+            )
+        )
+
+    @abstractmethod
+    async def asearch(
+        self,
+        config: dict[str, Any],
+        query: str,
+        memory_type: MemoryType | None = None,
+        category: str | None = None,
+        limit: int = 10,
+        score_threshold: float | None = None,
+        filters: dict[str, Any] | None = None,
+        retrieval_strategy: RetrievalStrategy | None = None,
+        distance_metric: DistanceMetric | None = None,
+        max_tokens: int = 4000,
+        **kwargs,
+    ) -> list[MemorySearchResult]:
+        """
+        Search memories by content similarity.
+
+        Args:
+            query: Search query
+            user_id: Filter by user
+            agent_id: Filter by agent
+            memory_type: Filter by memory type
+            category: Filter by category
+            limit: Maximum results
+            score_threshold: Minimum similarity score
+            filters: Additional filters
+            retrieval_strategy: Search strategy. ``None`` = use the store's configured default.
+            distance_metric: Distance metric. ``None`` = use the store's configured default.
+            **kwargs: Store-specific parameters
+
+        Returns:
+            List of matching memories
+        """
+        raise NotImplementedError
+
+    def search(
+        self,
+        config: dict[str, Any],
+        query: str,
+        memory_type: MemoryType | None = None,
+        category: str | None = None,
+        limit: int = 10,
+        score_threshold: float | None = None,
+        filters: dict[str, Any] | None = None,
+        retrieval_strategy: RetrievalStrategy | None = None,
+        distance_metric: DistanceMetric | None = None,
+        max_tokens: int = 4000,
+        **kwargs,
+    ) -> list[MemorySearchResult]:
+        """Synchronous wrapper for `asearch` that runs the async implementation."""
+        return run_coroutine(
+            self.asearch(
+                config,
+                query,
+                memory_type=memory_type,
+                category=category,
+                limit=limit,
+                score_threshold=score_threshold,
+                filters=filters,
+                retrieval_strategy=retrieval_strategy,
+                distance_metric=distance_metric,
+                max_tokens=max_tokens,
+                **kwargs,
+            )
+        )
+
+    @abstractmethod
+    async def aget(
+        self,
+        config: dict[str, Any],
+        memory_id: str,
+        **kwargs,
+    ) -> MemorySearchResult | None:
+        """Get a specific memory by ID."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def aget_all(
+        self,
+        config: dict[str, Any],
+        limit: int = 100,
+        **kwargs,
+    ) -> list[MemorySearchResult]:
+        """Get a specific memory by user_id."""
+        raise NotImplementedError
+
+    def get(self, config: dict[str, Any], memory_id: str, **kwargs) -> MemorySearchResult | None:
+        """Synchronous wrapper for `aget` that runs the async implementation."""
+        return run_coroutine(self.aget(config, memory_id, **kwargs))
+
+    def get_all(
+        self,
+        config: dict[str, Any],
+        limit: int = 100,
+        **kwargs,
+    ) -> list[MemorySearchResult]:
+        """Synchronous wrapper for `aget` that runs the async implementation."""
+        return run_coroutine(self.aget_all(config, limit=limit, **kwargs))
+
+    @abstractmethod
+    async def aupdate(
+        self,
+        config: dict[str, Any],
+        memory_id: str,
+        content: str | Message,
+        metadata: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> Any:
+        """
+        Update an existing memory.
+
+        Args:
+            memory_id: ID of memory to update
+            content: New content (optional)
+            metadata: New/additional metadata (optional)
+            **kwargs: Store-specific parameters
+        """
+        raise NotImplementedError
+
+    def update(
+        self,
+        config: dict[str, Any],
+        memory_id: str,
+        content: str | Message,
+        metadata: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> Any:
+        """Synchronous wrapper for `aupdate` that runs the async implementation."""
+        return run_coroutine(self.aupdate(config, memory_id, content, metadata=metadata, **kwargs))
+
+    @abstractmethod
+    async def adelete(
+        self,
+        config: dict[str, Any],
+        memory_id: str,
+        **kwargs,
+    ) -> Any:
+        """Delete a memory by ID."""
+        raise NotImplementedError
+
+    def delete(self, config: dict[str, Any], memory_id: str, **kwargs) -> None:
+        """Synchronous wrapper for `adelete` that runs the async implementation."""
+        return run_coroutine(self.adelete(config, memory_id, **kwargs))
+
+    @abstractmethod
+    async def aforget_memory(
+        self,
+        config: dict[str, Any],
+        **kwargs,
+    ) -> Any:
+        """Delete a memory by for a user or agent."""
+        raise NotImplementedError
+
+    def forget_memory(
+        self,
+        config: dict[str, Any],
+        **kwargs,
+    ) -> Any:
+        """Delete a memory by for a user or agent."""
+        return run_coroutine(self.aforget_memory(config, **kwargs))
+
+    # --- Cleanup and Resource Management ---
+
+    @abstractmethod
+    async def aping(self) -> None:
+        """Check that the store's backend is reachable; raise when it is not.
+
+        Must be read-only (no writes, no embedding, no collection creation) and cheap, because
+        a server may call it on every readiness probe. An in-process store just returns.
+
+        Raises:
+            Exception: Any error that shows the backend cannot be reached.
+        """
+        raise NotImplementedError
+
+    async def arelease(self) -> None:
+        """Clean up any resources used by the store (override in subclasses if needed)."""
+        raise NotImplementedError
+
+    def release(self) -> None:
+        """Clean up any resources used by the store (override in subclasses if needed)."""
+        return run_coroutine(self.arelease())

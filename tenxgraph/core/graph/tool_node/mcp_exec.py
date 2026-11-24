@@ -1,0 +1,460 @@
+"""MCPMixin — executes tools via a Model Context Protocol (MCP) client."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import inspect
+import json
+import logging
+import typing as t
+
+from pydantic import BaseModel
+
+from tenxgraph.core.authz import public_config
+from tenxgraph.core.exceptions import ToolDenied
+from tenxgraph.core.state import (
+    ContentBlock,
+    ErrorBlock,
+    Message,
+    ToolResultBlock,
+)
+from tenxgraph.runtime.publisher.events import EventType
+from tenxgraph.runtime.publisher.publish import publish_event
+from tenxgraph.runtime.publisher.trace_context import tool_span, use_trace_span
+from tenxgraph.utils import CallbackContext, CallbackManager, InvocationType
+from tenxgraph.utils.interrupt import activate as activate_interrupts
+
+from ._helpers import (
+    _normalize_resource_uri,
+    generic_tool_failure,
+    publish_tool_end,
+    tool_start_event,
+)
+from .denial import denied_tool_message
+from .mcp_auth import mcp_call_headers, resolve_mcp_headers
+
+
+logger = logging.getLogger("tenxgraph.graph.tool_node")
+
+
+DEFAULT_MCP_CONNECT_TIMEOUT = 30.0
+
+
+def _mcp_user_info(config: dict[str, t.Any]) -> dict[str, t.Any] | None:
+    """The caller info sent as MCP request metadata.
+
+    The API puts an ``Identity`` (a pydantic model) in ``config["user"]``; it is sent whole as
+    JSON (user_id, kind, tenant, roles, permissions, reach, claims). A dict is sent as is
+    (direct SDK use). Otherwise only ``config["user_id"]``, when set. Never the credential:
+    it lives under ``config["credential"]``, not in the identity.
+    """
+    user = config.get("user")
+    if isinstance(user, BaseModel):
+        return user.model_dump(mode="json")
+    if isinstance(user, dict) and user:
+        return user
+    user_id = config.get("user_id")
+    return {"user_id": user_id} if user_id else None
+
+
+def _fastmcp_tags(meta: dict[str, t.Any] | None) -> set[str]:
+    """The fastmcp tags of a listed tool: ``meta["fastmcp"]`` (current fastmcp), else the
+    ``meta["_fastmcp"]`` of older servers."""
+    for key in ("fastmcp", "_fastmcp"):
+        found = (meta or {}).get(key)
+        if isinstance(found, dict):
+            return set(found.get("tags") or [])
+    return set()
+
+
+class MCPMixin:
+    _client: t.Any | None
+    # The concrete ToolNode defines these
+    mcp_tools: list[str]  # type: ignore[assignment]
+    _pass_user_info_to_mcp: bool  # type: ignore[assignment]
+
+    @contextlib.asynccontextmanager
+    async def _mcp_session(
+        self,
+        config: dict[str, t.Any] | None = None,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> t.AsyncIterator[None]:
+        """Open the MCP client session, bounding only the connect by ``mcp_connect_timeout``.
+
+        The run's tool span for ``tool_call_id`` (a listing has none: the node span) is the
+        current OTEL span in the block, so fastmcp and ``mcp`` spans nest under it.
+
+        With ``mcp_auth`` set, its headers for this list or call are held in a ContextVar for
+        the block, where ``MCPCallAuth`` on the transport reads them.
+        """
+        timeout = getattr(self, "_mcp_connect_timeout", None)
+        mcp_auth = getattr(self, "_mcp_auth", None)
+        headers_token = None
+        if mcp_auth is not None:
+            headers = await resolve_mcp_headers(
+                mcp_auth, config, tool_name, getattr(self, "_mcp_server_url", None)
+            )
+            headers_token = mcp_call_headers.set(headers)
+        try:
+            # Attached and detached in this frame (the caller's task), around the yield.
+            with use_trace_span(tool_span(config, tool_call_id)):
+                async with self._open_mcp_client(timeout):
+                    yield
+        finally:
+            if headers_token is not None:
+                mcp_call_headers.reset(headers_token)
+
+    @contextlib.asynccontextmanager
+    async def _open_mcp_client(self, timeout: float | None) -> t.AsyncIterator[None]:
+        async with contextlib.AsyncExitStack() as stack:
+            if timeout is None:
+                await stack.enter_async_context(self._client)
+            else:
+                try:
+                    async with asyncio.timeout(timeout):
+                        await stack.enter_async_context(self._client)
+                except TimeoutError as exc:
+                    raise TimeoutError(f"MCP connect timed out after {timeout}s") from exc
+            yield
+
+    def _cap_mcp_result(self, blocks: list[ContentBlock]) -> list[ContentBlock]:
+        """Cut an MCP result that is longer than ``mcp_max_result_chars`` (opt-in)."""
+        cap = getattr(self, "_mcp_max_result_chars", None)
+        if cap is None:
+            return blocks
+        for block in blocks:
+            output = getattr(block, "output", None)
+            if output is None:
+                continue
+            text = output if isinstance(output, str) else json.dumps(output, default=str)
+            if len(text) > cap:
+                block.output = text[:cap] + f"\n[output cut: {len(text) - cap} more characters]"
+        return blocks
+
+    def _serialize_result(
+        self,
+        tool_call_id: str,
+        res: t.Any,
+        name: str | None = None,
+    ) -> list[ContentBlock]:
+        return self._cap_mcp_result(self._serialize_result_uncapped(tool_call_id, res, name))
+
+    def _serialize_result_uncapped(
+        self,
+        tool_call_id: str,
+        res: t.Any,
+        name: str | None = None,
+    ) -> list[ContentBlock]:
+        def safe_serialize(obj: t.Any) -> dict[str, t.Any]:
+            try:
+                json.dumps(obj)
+                return obj if isinstance(obj, dict) else {"content": obj}
+            except (TypeError, OverflowError):
+                if hasattr(obj, "model_dump"):
+                    dumped = obj.model_dump()  # type: ignore
+                    return _normalize_resource_uri(dumped)
+                return {"content": str(obj), "type": "fallback"}
+
+        for source in [
+            getattr(res, "content", None),
+            getattr(res, "structured_content", None),
+            getattr(res, "data", None),
+        ]:
+            if source is None:
+                continue
+            try:
+                if isinstance(source, list):
+                    result = [safe_serialize(item) for item in source]
+                else:
+                    result = [safe_serialize(source)]
+
+                return [
+                    ToolResultBlock(
+                        call_id=tool_call_id,
+                        name=name,
+                        output=result,
+                        is_error=False,
+                        status="completed",
+                    )
+                ]
+            except Exception as e:
+                logger.exception("Serialization failure: %s", e)
+                continue
+
+        return [
+            ToolResultBlock(
+                call_id=tool_call_id,
+                name=name,
+                output=[
+                    {
+                        "content": str(res),
+                        "type": "fallback",
+                    }
+                ],
+                is_error=False,
+                status="completed",
+            )
+        ]
+
+    async def _list_server_tools(
+        self,
+        refresh: bool = False,
+        config: dict[str, t.Any] | None = None,
+    ) -> list[t.Any] | None:
+        """List the server's tools, from the per-node cache when ``mcp_cache_tools`` is on.
+
+        Returns None when the server cannot be listed; a failed listing is never cached.
+        The cache is shared by every run of the node, so with ``mcp_auth`` the list must not
+        depend on the user: it is fetched with whichever run asks first.
+        """
+        cached = getattr(self, "_mcp_tools_cache", None)
+        if cached is not None and not refresh:
+            return cached
+        try:
+            # No ping first: list_tools fails on its own when the server is down, and MCP
+            # protocol 2026-07-28 (fastmcp 4.x default) has no ping method.
+            async with self._mcp_session(config):
+                server_tools = list(await self._client.list_tools())
+        except Exception as e:
+            logger.exception("Failed to fetch MCP tools: %s", e)
+            return None
+        if getattr(self, "_mcp_cache_tools", False):
+            self._mcp_tools_cache = server_tools
+        return server_tools
+
+    async def refresh_mcp_tools(self) -> list[dict]:
+        """Drop the cached MCP tool list and fetch it again from the server."""
+        self._mcp_tools_cache = None
+        if not self._client:
+            return []
+        await self._list_server_tools(refresh=True)
+        return await self._get_mcp_tool()
+
+    def _mcp_exposed_name(self, name: str) -> str:
+        return f"{getattr(self, '_mcp_prefix', None) or ''}{name}"
+
+    def _mcp_server_name(self, name: str) -> str:
+        """The server's own name for a tool the model sees as ``name``."""
+        prefix = getattr(self, "_mcp_prefix", None)
+        if prefix and name.startswith(prefix):
+            return name[len(prefix) :]
+        return name
+
+    async def _get_mcp_tool(
+        self,
+        tags: set[str] | None = None,
+        config: dict[str, t.Any] | None = None,
+    ) -> list[dict]:
+        """Fetch tools from the MCP client, optionally filtering by tags.
+
+        ``mcp_tools`` is rebuilt from the server's full tool list on every call, so it stays
+        bounded and dispatch works for tools hidden by the ``tags`` filter.
+
+        Raises:
+            ValueError: If an MCP tool has the same name as a local or remote tool.
+        """
+        tools: list[dict] = []
+        if not self._client:
+            return tools
+
+        server_tools = await self._list_server_tools(config=config)
+        if server_tools is None:
+            return tools
+
+        # Keep only the tools the developer allowed, so a hidden tool is also not callable.
+        include = getattr(self, "_mcp_include", None)
+        exclude = getattr(self, "_mcp_exclude", frozenset())
+        server_tools = [
+            i
+            for i in server_tools
+            if (include is None or i.name in include) and i.name not in exclude
+        ]
+
+        # Raised outside the try above so a collision is never swallowed.
+        local_names = set(getattr(self, "_funcs", {}))
+        local_names |= set(getattr(self, "remote_tool_names", []))
+        names: list[str] = []
+        for i in server_tools:
+            exposed = self._mcp_exposed_name(i.name)
+            if exposed in local_names:
+                raise ValueError(
+                    f"MCP tool '{exposed}' has the same name as a local or remote tool on "
+                    "this ToolNode. Rename one of them."
+                )
+            if exposed not in names:
+                names.append(exposed)
+
+        self.mcp_tools = names
+
+        max_desc = getattr(self, "_mcp_max_description_chars", None)
+        advertised: set[str] = set()
+        for i in server_tools:
+            exposed = self._mcp_exposed_name(i.name)
+            if exposed in advertised:
+                continue
+            if tags and not _fastmcp_tags(i.meta).intersection(tags):
+                continue
+            advertised.add(exposed)
+            description = i.description
+            if (
+                max_desc is not None
+                and isinstance(description, str)
+                and len(description) > max_desc
+            ):
+                description = description[:max_desc] + "..."
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": exposed,
+                        "description": description,
+                        # mcp 2 names the field ``input_schema``; ``inputSchema`` is
+                        # fastmcp's deprecated shim, absent without fastmcp or with
+                        # its camelCase compat turned off.
+                        "parameters": i.input_schema,
+                    },
+                }
+            )
+
+        return tools
+
+    async def _mcp_execute(
+        self,
+        name: str,
+        args: dict,
+        tool_call_id: str,
+        config: dict[str, t.Any],
+        callback_mgr: CallbackManager,
+    ) -> Message:
+        context = CallbackContext(
+            invocation_type=InvocationType.MCP,
+            node_name=config.get("_node_name", ""),
+            function_name=name,
+            metadata={
+                "tool_call_id": tool_call_id,
+                "args": args,
+                "config": public_config(config),
+                "mcp_client": bool(self._client),
+            },
+        )
+
+        meta = {
+            "function_name": name,
+            "function_argument": args,
+            "tool_call_id": tool_call_id,
+        }
+
+        event = tool_start_event(config, name, args, tool_call_id, is_mcp=True)
+        publish_event(event)
+
+        input_data = {**args}
+
+        try:
+            # In the call's interrupt scope, so a callback can ask a human (ToolGuard approval).
+            with activate_interrupts(config, tool_call_id):
+                input_data = await callback_mgr.execute_before_invoke(context, input_data)
+
+            if not self._client:
+                error_result = Message.tool_message(
+                    content=[
+                        ErrorBlock(
+                            message="No MCP client configured",
+                        ),
+                        ToolResultBlock(
+                            call_id=tool_call_id,
+                            name=name,
+                            output="No MCP client configured",
+                            is_error=True,
+                            status="failed",
+                        ),
+                    ],
+                    meta=meta,
+                )
+                res = await callback_mgr.execute_after_invoke(context, input_data, error_result)
+                event.metadata["error"] = "No MCP client configured"
+                publish_tool_end(
+                    event,
+                    "No MCP client configured",
+                    message=res if isinstance(res, Message) else error_result,
+                    error="No MCP client configured",
+                    event_type=EventType.ERROR,
+                )
+                return res
+
+            # No ping first: call_tool fails on its own when the server is down (handled
+            # below), and MCP protocol 2026-07-28 (fastmcp 4.x default) has no ping method.
+            server_name = self._mcp_server_name(name)
+            async with self._mcp_session(config, server_name, tool_call_id):
+                call_kwargs: dict[str, t.Any] = {}
+                if self._pass_user_info_to_mcp:
+                    mcp_user_info = _mcp_user_info(config)
+                    if mcp_user_info:
+                        # Request metadata, not a tool argument: a strict input schema
+                        # would reject an extra "user" argument, and a lax one would
+                        # hand every claim to the tool body.
+                        params = inspect.signature(self._client.call_tool).parameters
+                        if "meta" in params or any(
+                            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+                        ):
+                            call_kwargs["meta"] = {"user": mcp_user_info}
+                        else:
+                            logger.warning(
+                                "pass_user_info_to_mcp needs a fastmcp client whose "
+                                "call_tool accepts meta; user info was not sent."
+                            )
+
+                res: t.Any = await self._client.call_tool(server_name, input_data, **call_kwargs)
+
+                final_res = self._serialize_result(tool_call_id, res, name)
+
+                result = Message.tool_message(
+                    content=final_res,
+                    meta=meta,
+                )
+
+                res = await callback_mgr.execute_after_invoke(context, input_data, result)
+                # Publish what after_invoke returned, not the raw result it replaced.
+                published = res if isinstance(res, Message) else result
+                publish_tool_end(event, "MCP tool execution complete", message=published)
+                return res
+
+        except ToolDenied as denied:
+            # A policy block is final: on_error recovery must not turn it into a success.
+            return denied_tool_message(denied, name, tool_call_id, config, event, meta)
+
+        except Exception as e:
+            recovery_result = await callback_mgr.execute_on_error(context, input_data, e)
+
+            if isinstance(recovery_result, Message):
+                publish_tool_end(
+                    event, "MCP tool execution complete, with recovery", message=recovery_result
+                )
+                return recovery_result
+
+            # The raw text can hold server internals; the model and the event get a reference.
+            error_text = generic_tool_failure(name, tool_call_id, e, log=logger)
+
+            failed = Message.tool_message(
+                content=[
+                    ToolResultBlock(
+                        call_id=tool_call_id,
+                        name=name,
+                        output=error_text,
+                        is_error=True,
+                        status="failed",
+                    ),
+                    ErrorBlock(message=error_text),
+                ],
+                meta=meta,
+            )
+            publish_tool_end(
+                event,
+                "MCP tool execution complete, with error",
+                message=failed,
+                error=error_text,
+                exc=e,
+                config=config,
+            )
+            return failed

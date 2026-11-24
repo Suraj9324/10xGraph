@@ -1,0 +1,148 @@
+"""Pytest configuration and fixtures for all tests.
+
+This module provides common fixtures and setup for the entire test suite.
+"""
+
+import os
+
+import pytest
+from injectq.testing import isolated_container
+
+from tenxgraph.core.graph.node import Node
+
+
+_ORIGINAL_NODE_INIT = Node.__init__
+
+
+def pytest_addoption(parser):
+    """Register the --integration flag.
+
+    Integration tests were previously gated on a `--integration` option that was
+    never actually registered, so the gate could never be satisfied and every
+    durable-storage test was permanently skipped. Registering it here is what
+    makes those tests runnable at all.
+    """
+    parser.addoption(
+        "--integration",
+        action="store_true",
+        default=False,
+        help="Run integration tests that require real services (Postgres, Redis).",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip `integration`-marked tests unless --integration is passed.
+
+    This replaces per-class `@pytest.mark.skipif(True, ...)` hardcodes, which
+    could never be turned on. Now the gate is real: pass --integration (with the
+    services running) and the durable-storage tests actually execute.
+    """
+    if config.getoption("--integration"):
+        return
+
+    skip_integration = pytest.mark.skip(
+        reason="requires real services; run with --integration (see tests/integration/)"
+    )
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip_integration)
+
+
+@pytest.fixture(autouse=True)
+def isolate_injectq_container():
+    """Give every test a clean dependency-injection container.
+
+    `InjectQ.get_instance()` is a process-wide singleton, and tests bind real
+    instances into it (publishers, checkpointers, task managers). Nothing reset
+    it between tests, so bindings leaked forward: a test that bound a publisher
+    left it installed for everything that ran afterwards. That is why the suite
+    passed per-file but failed in full-suite order -- a test asserting on its own
+    spy publisher was silently still publishing into a previous test's binding.
+
+    ``isolated_container()`` makes a fresh container both the global instance and the active
+    one for the test, and restores both afterwards, so the suite is order-independent. That
+    includes a container a test activates (a graph built with ``container=`` activates it).
+    """
+    with isolated_container():
+        yield
+
+
+@pytest.fixture(autouse=True)
+def close_sqlite_checkpointers(monkeypatch):
+    """Close every SqliteCheckpointer connection a test opened and never released.
+
+    aiosqlite runs each connection on a non-daemon worker thread. A test that opens a
+    checkpointer and forgets ``arelease()`` (or whose event loop is gone by then) leaves that
+    thread parked on its queue, and the pytest process then never exits after the tests pass.
+    Applications release through ``graph.aclose()``; this is the test-side equivalent.
+    """
+    import asyncio
+    import contextlib
+    import threading
+
+    from tenxgraph.storage.checkpointer.sqlite_checkpointer import SqliteCheckpointer
+
+    opened: list[SqliteCheckpointer] = []
+    original = SqliteCheckpointer._get_conn
+
+    async def tracking_get_conn(self):
+        if self not in opened:
+            opened.append(self)
+        return await original(self)
+
+    monkeypatch.setattr(SqliteCheckpointer, "_get_conn", tracking_get_conn)
+    yield
+
+    def release_all() -> None:
+        async def run() -> None:
+            for checkpointer in opened:
+                if checkpointer._conn is not None:
+                    with contextlib.suppress(Exception):  # best effort cleanup
+                        await checkpointer.arelease()
+
+        asyncio.run(run())
+
+    # A fresh thread: the test's own loop may still be running or already closed.
+    worker = threading.Thread(target=release_all)
+    worker.start()
+    worker.join(timeout=10)
+
+
+def _compat_node_init(self, name, func, publisher=None):
+    """Test-only compatibility shim for legacy Node(name, func, publisher) calls."""
+    _ORIGINAL_NODE_INIT(self, name, func)
+    self.publisher = publisher
+
+
+@pytest.fixture(scope="session", autouse=True)
+def setup_test_environment():
+    """Set up environment variables for testing.
+    
+    This fixture automatically runs for all test sessions and sets
+    dummy API keys to prevent test failures due to missing credentials.
+    This is test-only setup and does not affect production code.
+    """
+    # Set dummy OpenAI API key for tests
+    # Using a valid-looking but fake key that won't make actual API calls
+    os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy-key-for-testing-only")
+
+    # Set dummy Google API key for tests
+    os.environ.setdefault("GEMINI_API_KEY", "dummy-gemini-key-for-testing-only")
+
+    # Vertex AI selection must NOT be inherited from a developer's .env / shell.
+    # Agent() reads GOOGLE_GENAI_USE_VERTEXAI as the default for use_vertex_ai, so
+    # an ambient "true" would make provider auto-detection resolve to "google" for
+    # every model and break deterministic unit tests. Force it off for the suite;
+    # tests that exercise Vertex pass use_vertex_ai=True explicitly.
+    os.environ.pop("GOOGLE_GENAI_USE_VERTEXAI", None)
+
+    # Keep tests compatible while core graph transitions from
+    # Node(name, func, publisher) to Node(name, func).
+    Node.__init__ = _compat_node_init
+
+    yield
+
+    Node.__init__ = _ORIGINAL_NODE_INIT
+
+    # Note: We don't clean up the environment variables since they're test-only
+    # and won't affect any other processes

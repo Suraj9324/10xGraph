@@ -1,0 +1,446 @@
+[project]
+name = "10xgraph"
+version = "1.0.0"
+description = "Core library of 10xGraph (formerly Agentflow), open-source self-hosted infrastructure for AI applications: graph engine, durable Postgres and Redis state with tenant columns, pgvector memory, replay-safe tools, MCP, tracing and evals. Pair with 10xgraph-api for the API server. MIT, any model."
+readme = "README.md"
+keywords = [
+    "agent",
+    "agents",
+    "ai-agents",
+    "multi-agent",
+    "multi-agent-systems",
+    "agentic-ai",
+    "agent-framework",
+    "agent-orchestration",
+    "workflow-engine",
+    "state-machine",
+    "stategraph",
+    "graph",
+    "llm",
+    "llm-framework",
+    "llm-orchestration",
+    "genai",
+    "generative-ai",
+    "production",
+    "self-hosted",
+    "fault-tolerance",
+    "idempotency",
+    "durable-state",
+    "checkpointing",
+    "human-in-the-loop",
+    "redis",
+    "postgresql",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "google-genai",
+    "mcp",
+    "model-context-protocol",
+    "tool-use",
+    "function-calling",
+    "react-agent",
+    "rag",
+    "memory",
+    "vector-store",
+    "qdrant",
+    "realtime-audio",
+    "opentelemetry",
+    "kafka",
+    "10xgraph",
+    "agentflow",
+]
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+dependencies = [
+    # injectq is the DI backbone and is pre-1.0, so it makes no stability promise:
+    # under SemVer a 0.x minor bump may break the API. Without an upper bound, a
+    # future minor release would be picked up automatically and break every fresh
+    # install of this package. Cap at the next minor until each release is verified.
+    # 0.7.0 is required: it keeps 0.6's per-task active container (no thread-local leak
+    # between concurrent runs, set_current() returns a token) and fixes the async factory
+    # and override bugs listed in cleanup-review/INJECTQ_BUGS.md.
+    "injectq>=0.7.0,<0.8",
+    "pydantic>=2.0,<3",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+]
+authors = [
+    {name = "Shudipto Trafder", email = "shudiptotrafder@gmail.com"},
+]
+maintainers = [
+    {name = "Shudipto Trafder", email = "shudiptotrafder@gmail.com"},
+    {name = "10xScale", email = "contact@10xscale.ai"},
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    # 1.0: the public API is stable under the deprecation policy in CHANGELOG.md.
+    "Development Status :: 5 - Production/Stable",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+
+[project.urls]
+Homepage = "https://10xgraph.com"
+Repository = "https://github.com/10xGraph/10xGraph"
+Issues = "https://github.com/10xGraph/10xGraph/issues"
+Documentation = "https://10xgraph.com"
+Changelog = "https://github.com/10xGraph/10xGraph/blob/main/CHANGELOG.md"
+
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+google-genai = ["google-genai>=1.56.0"]
+realtime = ["google-genai>=1.56.0"]
+# Floor 1.93.1: chat.completions.parse left beta in 1.92.0 and responses.parse gained its
+# full argument list (reasoning, instructions, tools) in 1.93.1. Capped at <4 so a future
+# major (3.0 swapped httpx for httpx2) is not pulled in automatically.
+openai = ["openai>=1.93.1,<4"]
+# Capped at <2: the SDK went 0.x -> 1.0.0 (httpx2, awaited async raw responses),
+# so an uncapped lower bound would pull a future major automatically.
+anthropic = ["anthropic>=1.0.0,<2"]
+anthropic-vertex = ["anthropic[vertex]>=1.0.0,<2"]
+anthropic-bedrock = ["anthropic[bedrock]>=1.0.0,<2"]
+pg_checkpoint = ["asyncpg>=0.29.0","redis>=4.2"]
+sqlite_checkpoint = ["aiosqlite>=0.19.0"]
+# fastmcp 4 / mcp 2: ToolNode(mcp_auth=...) needs each request sent with the caller's context.
+mcp = ["fastmcp>=4.1.7","mcp>=2.3.0"]
+images = ["Pillow>=13.0.0"]
+cloud-storage = ["cloud-storage-manager>=0.1.2"]
+redis = ["redis>=4.2"]
+kafka = ["aiokafka>=0.8.0"]
+rabbitmq = ["aio-pika>=9.0.0"]
+qdrant = ["qdrant-client>=1.10.0"]
+# Postgres + pgvector store (PgVectorStore). Needs the pgvector extension >= 0.7.0 on the server.
+pgvector = ["asyncpg>=0.29.0", "pgvector>=0.5.1"]
+otel = [
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+]
+logfire = ["logfire>=3.0.0"]
+langsmith = [
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
+phoenix = [
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
+otlp = [
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
+observability = [
+    "10xgraph[otel,logfire,langsmith,phoenix,otlp]",
+]
+
+all_publishers = [
+    "redis>=4.2",
+    "aiokafka>=0.8.0",
+    "aio-pika>=9.0.0",
+]
+
+# Every other extra at once, for development and CI. The two Claude cloud
+# backends cost nothing to include: google-genai already pulls google-auth and
+# cloud-storage pulls boto3, so the resolved set is identical with or without
+# them. Verified with `uv pip compile --extra all`.
+all = [
+    "10xgraph[google-genai,openai,realtime,mcp]",
+    "10xgraph[anthropic,anthropic-vertex,anthropic-bedrock]",
+    "10xgraph[pg_checkpoint,sqlite_checkpoint]",
+    "10xgraph[qdrant,pgvector]",
+    "10xgraph[all_publishers,observability]",
+    "10xgraph[images,cloud-storage]",
+]
+
+[tool.setuptools.packages.find]
+include = ["tenxgraph*", "agentflow*"]
+exclude = ["normal_tests*", "tests*", "examples*", "docs*"]
+
+[tool.setuptools.package-data]
+tenxgraph = ["py.typed"]
+agentflow = ["py.typed"]
+
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+lint.fixable = ["ALL"]
+lint.select = [
+    "E",   # pycodestyle
+    "W",   # pycodestyle
+    "F",   # Pyflakes
+    "PL",  # pylint
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "A",   # flake8-builtins
+    "S",   # flake8-bandit
+    "ISC", # flake8-implicit-str-concat
+    "ICN", # flake8-import-conventions
+    "PIE", # flake8-pie
+    "Q",   # flake8-quotes
+    "RET", # flake8-return
+    "SIM", # flake8-simplify
+    "TID", # flake8-tidy-imports
+    "RUF", # Ruff-specific rules
+    "YTT", # flake8-2020
+    "UP",  # pyupgrade
+    "C4",  # flake8-comprehensions
+    "PTH", # flake8-use-pathlib
+    "G",   # flake8-logging-format
+    "INP", # flake8-no-pep420
+    "T20", # flake8-print
+]
+lint.ignore = [
+    "UP006", # https://github.com/charliermarsh/ruff/pull/4427
+    "UP007", # https://github.com/charliermarsh/ruff/pull/4427
+    # Mutable class attributes should be annotated with `typing.ClassVar`
+    # Too many violations
+    "RUF012",
+    # Logging statement uses f-string
+    "G004",
+    #B904 Within an `except` clause, raise exceptions with
+    #`raise ... from err` or `raise ... from None` to distinguish
+    #them from errors in exception handling
+    "B904",
+    #Do not perform function call `Injected` in argument defaults
+    "B008",
+    "ISC001",# flake8-implicit-str-concat
+]
+# Allow unused variables when underscore-prefixed.
+lint.dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+exclude = [
+    "migrations/*",  # Exclude the migrations folder
+    "venv/*",
+    "example/*",
+    "tests/*",
+    "docs/*",
+]
+
+
+[tool.ruff.lint.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"bin/*.py" = ["E402", "S603", "T201", "S101"]
+"*/tests/*.py" = ["E402", "S603", "T201", "S101","PLR2004"]
+"tests/**/*.py" = ["E402", "S603", "T201", "S101", "PLR2004"]
+"*/test/*.py" = ["E402", "S603", "T201", "S101"]
+"scripts/*.py" = ["E402", "S603", "T201", "S101", "INP001"]
+"*/__init__.py" = ["E402", "S603", "T201", "S101"]
+"*/migrations/*.py" = ["E402", "S603", "T201", "S101"]
+"tenxgraph/adapters/llm/openai_converter.py" = ["PLR0912"]
+"tenxgraph/adapters/llm/openai_responses_converter.py" = ["PLR0912", "PLR0915"]
+"tenxgraph/graph/agent.py" = ["PLR0912", "PLR0913"]
+"tenxgraph/runtime/publisher/otel_publisher.py" = ["PLR0912"]
+# Type dispatchers: one return per supported annotation reads better as a flat table.
+"tenxgraph/core/graph/tool_node/schema.py" = ["PLR0911"]
+"tenxgraph/qa/evaluation/reporters/_html_css.py" = ["E501"]
+"tenxgraph/qa/evaluation/reporters/_html_js.py" = ["E501"]
+"tenxgraph/qa/evaluation/reporters/_html_template.py" = ["E501", "PLR0913"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["src"]
+[tool.ruff.lint.pylint]
+max-args = 10
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+
+[tool.bandit]
+exclude_dirs = ["*/tests/*", "*/migrations", "*/scripts/*", "docs/*", "examples/*"]
+skips = ["B101", "B611", "B601", "B608", "B102", "B307", "B405"]
+
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+namespace_packages = true
+explicit_package_bases = true
+warn_unused_configs = true
+exclude = [
+    "normal_tests/*",
+    "tests/*",
+    "examples/*",
+    "docs/*",
+]
+
+# Phased adoption: mypy was wired into CI after the codebase already existed, so
+# it does not block on the modules that still carry pre-existing type errors.
+# These are still parsed (so downstream type info is available) but their own
+# errors are silenced. Burn the list down by cleaning a module's types and
+# deleting its entry here; everything NOT listed is already gating.
+# KNOWN DEBT (audit P3): type checking is disabled for the modules below via
+# `ignore_errors = true`, which includes the whole core graph engine -- the most
+# critical code in the package.
+#
+# Measured 2026-07-14: re-enabling produces 238 errors across 32 files, concentrated
+# in agent_internal/execution.py (40), google.py (30) and openai.py (24). That is a
+# real refactor, not a config flip, so it is tracked rather than silently "fixed".
+#
+# Ratchet: this list must only ever get SHORTER. New modules are type-checked by
+# default -- do not add to it. Retire it module by module, cheapest first.
+[[tool.mypy.overrides]]
+module = [
+    "tenxgraph.core.graph.agent",
+    "tenxgraph.core.graph.agent_internal.execution",
+    "tenxgraph.core.graph.agent_internal.google",
+    "tenxgraph.core.graph.agent_internal.memory",
+    "tenxgraph.core.graph.agent_internal.openai",
+    "tenxgraph.core.graph.compiled_graph",
+    "tenxgraph.core.graph.node",
+    "tenxgraph.core.graph.state_graph",
+    "tenxgraph.core.graph.tool_node.base",
+    "tenxgraph.core.graph.tool_node.mcp_exec",
+    "tenxgraph.core.graph.tool_node.schema",
+    "tenxgraph.core.graph.utils.handler_utils",
+    "tenxgraph.core.graph.utils.stream_handler",
+    "tenxgraph.core.graph.utils.utils",
+    "tenxgraph.prebuilt.tools.calculator",
+    "tenxgraph.prebuilt.tools.fetch",
+    "tenxgraph.prebuilt.tools.files",
+    "tenxgraph.prebuilt.tools.memory",
+    "tenxgraph.prebuilt.tools.search",
+    "tenxgraph.qa.evaluation.criteria.llm_utils",
+    "tenxgraph.qa.evaluation.evaluator",
+    "tenxgraph.qa.evaluation.quick_eval",
+    "tenxgraph.qa.evaluation.reporters.console",
+    "tenxgraph.qa.evaluation.simulators.user_simulator",
+    "tenxgraph.qa.testing.quick_test",
+    "tenxgraph.qa.testing.test_agent",
+    "tenxgraph.runtime.adapters.llm.google_genai_converter",
+    "tenxgraph.runtime.adapters.llm.model_response_converter",
+    "tenxgraph.runtime.adapters.llm.openai_converter",
+    "tenxgraph.runtime.adapters.llm.openai_responses_converter",
+    "tenxgraph.runtime.publisher.publish",
+    "tenxgraph.storage.checkpointer.pg_checkpointer",
+    "tenxgraph.storage.checkpointer.sqlite_checkpointer",
+    "tenxgraph.storage.media.processor",
+    "tenxgraph.storage.store.embedding.google_embedding",
+    "tenxgraph.storage.store.long_term_memory",
+    "tenxgraph.storage.store.qdrant_store",
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+env = [
+    "ENVIRONMENT=pytest",
+]
+testpaths = [
+    "tests/",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning"
+]
+# Only collect tests from the tests directory
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Exclude other directories from test discovery
+norecursedirs = [
+    "normal_tests",
+    "examples",
+    "docs",
+    ".git",
+    ".tox",
+    "dist",
+    "build",
+    "agentflow.egg-info",
+    "10xgraph.egg-info",
+    "__pycache__",
+    ".venv"
+]
+addopts = [
+    "--cov=tenxgraph",
+    # Measure branch coverage locally too, not just in CI. Without it the local
+    # gate was line-only, so a branch-coverage regression only showed up in CI.
+    "--cov-branch",
+    "--cov-report=html",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
+    "--cov-fail-under=80",
+    "--strict-markers",
+    "-v"
+]
+markers = [
+    "asyncio: mark test as async test",
+    "integration: mark test as integration test requiring real databases",
+    "slow: mark test as slow test that takes longer to run",
+    "real_schema_init: let PgCheckpointer create its schema on first use (default in tests/checkpointer: skipped)",
+]
+
+[tool.coverage.run]
+source = ["tenxgraph"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__pycache__/*",
+    "normal_tests/*",
+    "examples/*",
+    "docs/*"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.pytest-env]
+ENVIRONMENT = "pytest"
+
+[dependency-groups]
+dev = [
+    # pytest 9.2 removed Node._nodeid, which pytest-benchmark 5.3 still reads; drop the cap once it is fixed.
+    "pytest>=8.4.2,<9.2",
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=7.0.0",
+    "pytest-env>=1.1.5",
+    "pytest-xdist>=3.8.0",
+    "pytest-benchmark>=5.1.0",
+    "hypothesis>=6.100.0",
+    "pre-commit>=3.8.0",
+    "mypy>=1.11.0",
+    "types-PyYAML",
+    "Pillow>=13.0.0",
+    "asyncpg>=0.30.0",
+    "redis>=6.4.0",
+    "fastmcp>=4.1.7",
+    "mcp>=2.3.0",
+    "google-genai>=1.56.0",
+    "aiohttp>=3.14.4",
+    "aiosqlite>=0.19.0",
+    # Were installed only through mem0ai before Mem0Store was removed; tests import them directly.
+    "openai>=1.93.1,<4",
+    # tests/graph/test_sdk_kwargs.py checks the real SDK signatures.
+    "anthropic>=1.0.0,<2",
+    "qdrant-client>=1.10.0"
+]
+

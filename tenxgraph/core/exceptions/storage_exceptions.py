@@ -1,0 +1,261 @@
+"""Structured exception taxonomy for persistence & runtime layers.
+
+These exceptions let higher-level orchestration decide retry / fail-fast logic
+instead of relying on broad ``except Exception`` blocks.
+
+All storage exceptions now support structured error responses with error codes
+and contextual logging for better observability.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from ._redact import redact_context
+from ._structured import _StructuredError
+
+
+logger = logging.getLogger("tenxgraph.exceptions")
+
+
+class StorageError(_StructuredError, Exception):
+    """Base class for non-retryable storage layer errors.
+
+    Provides structured error handling with error codes and context.
+
+    Attributes:
+        message (str): Human-readable description of the error
+        error_code (str): Unique error code for categorization
+        context (dict): Additional contextual information about the error
+    """
+
+    _log_prefix = "StorageError"
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "STORAGE_000",
+        context: dict[str, Any] | None = None,
+    ):
+        """Initialize a StorageError with structured error information.
+
+        Args:
+            message (str): Description of the error.
+            error_code (str): Unique error code for categorization (default: "STORAGE_000")
+            context (dict): Additional contextual information (default: None)
+        """
+        self._init_error(message, error_code, context)
+        super().__init__(message)
+
+
+class TransientStorageError(StorageError):
+    """Retryable storage error (connection drops, timeouts).
+
+    This exception indicates a temporary failure that may succeed on retry.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "STORAGE_TRANSIENT_000",
+        context: dict[str, Any] | None = None,
+    ):
+        """Initialize a TransientStorageError.
+
+        Args:
+            message (str): Description of the transient error.
+            error_code (str): Unique error code (default: "STORAGE_TRANSIENT_000")
+            context (dict): Additional contextual information (default: None)
+        """
+        logger.warning(
+            "TransientStorageError [%s]: %s | Context: %s",
+            error_code,
+            message,
+            redact_context(context or {}),
+            exc_info=True,
+        )
+        super().__init__(message, error_code, context)
+
+
+class SerializationError(StorageError):
+    """Raised when (de)serialization of state/messages fails deterministically.
+
+    This exception indicates a permanent failure in data serialization/deserialization.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "STORAGE_SERIALIZATION_000",
+        context: dict[str, Any] | None = None,
+    ):
+        """Initialize a SerializationError.
+
+        Args:
+            message (str): Description of the serialization error.
+            error_code (str): Unique error code (default: "STORAGE_SERIALIZATION_000")
+            context (dict): Additional contextual information (default: None)
+        """
+        logger.error(
+            "SerializationError [%s]: %s | Context: %s",
+            error_code,
+            message,
+            redact_context(context or {}),
+            exc_info=True,
+        )
+        super().__init__(message, error_code, context)
+
+
+class SchemaVersionError(StorageError):
+    """Raised when schema version detection or migration application fails.
+
+    This exception indicates issues with database schema versioning.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "STORAGE_SCHEMA_000",
+        context: dict[str, Any] | None = None,
+    ):
+        """Initialize a SchemaVersionError.
+
+        Args:
+            message (str): Description of the schema version error.
+            error_code (str): Unique error code (default: "STORAGE_SCHEMA_000")
+            context (dict): Additional contextual information (default: None)
+        """
+        logger.error(
+            "SchemaVersionError [%s]: %s | Context: %s",
+            error_code,
+            message,
+            redact_context(context or {}),
+            exc_info=True,
+        )
+        super().__init__(message, error_code, context)
+
+
+class StaleStateError(StorageError):
+    """Raised when a durable state write loses an optimistic-concurrency check.
+
+    The writer based its update on a state version that is no longer current,
+    which means another execution committed a newer state for the same thread
+    in the meantime. Committing anyway would silently discard that other
+    execution's work (a lost update), so the write is rejected instead.
+
+    Callers (e.g. an API layer) should treat this as a conflict (HTTP 409):
+    reload the latest state and retry, rather than overwrite blindly.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "STORAGE_CONFLICT_000",
+        context: dict[str, Any] | None = None,
+    ):
+        """Initialize a StaleStateError.
+
+        Args:
+            message (str): Description of the concurrency conflict.
+            error_code (str): Unique error code (default: "STORAGE_CONFLICT_000")
+            context (dict): Additional contextual information (default: None)
+        """
+        logger.warning(
+            "StaleStateError [%s]: %s | Context: %s",
+            error_code,
+            message,
+            redact_context(context or {}),
+        )
+        super().__init__(message, error_code, context)
+
+
+class ResourceNotFoundError(StorageError):
+    """Raised when a requested resource is not found in storage.
+
+    This exception indicates that the specified resource does not exist.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "STORAGE_NOT_FOUND_000",
+        context: dict[str, Any] | None = None,
+    ):
+        """Initialize a ResourceNotFoundError.
+
+        Args:
+            message (str): Description of the not found error.
+            error_code (str): Unique error code (default: "STORAGE_NOT_FOUND_000")
+            context (dict): Additional contextual information (default: None)
+        """
+        logger.error(
+            "ResourceNotFoundError [%s]: %s | Context: %s",
+            error_code,
+            message,
+            redact_context(context or {}),
+            exc_info=True,
+        )
+        super().__init__(message, error_code, context)
+
+
+class ThreadNotFoundError(ResourceNotFoundError):
+    """Raised when a write names a thread the caller cannot write.
+
+    The thread belongs to another user or tenant. Writes always stay with the caller's own
+    threads, whatever their reach. The message is the one a missing thread would give, so it
+    never reveals that the id exists; the API answers 404.
+    """
+
+    def __init__(self, thread_id: Any = None):
+        """Initialize a ThreadNotFoundError.
+
+        Args:
+            thread_id: The thread the caller named.
+        """
+        # A normal 404 path, so skip the error-level logging of the parent constructors.
+        self.message = "Thread not found"
+        self.error_code = "STORAGE_NOT_FOUND_001"
+        self.context = {"thread_id": thread_id}
+        logger.debug("ThreadNotFoundError [%s]: %s", self.error_code, redact_context(self.context))
+        Exception.__init__(self, self.message)
+
+
+class MessageNotFoundError(IndexError, ValueError):
+    """Raised by ``aget_message`` when the thread has no message with that id.
+
+    It is both an ``IndexError`` and a ``ValueError``, so code that caught either one keeps
+    working. The message does not say whether the thread exists or belongs to someone else.
+    """
+
+    def __init__(self) -> None:
+        """Initialize a MessageNotFoundError."""
+        super().__init__("Message not found")
+
+
+class MetricsError(_StructuredError, Exception):
+    """Raised when metrics emission fails (should normally be swallowed/logged).
+
+    This exception is typically used for non-critical metrics reporting failures.
+    """
+
+    _log_prefix = "MetricsError"
+    # Metrics errors are normally non-critical, so they log as a warning without a traceback.
+    _log_level = logging.WARNING
+    _log_exc_info = False
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "METRICS_000",
+        context: dict[str, Any] | None = None,
+    ):
+        """Initialize a MetricsError.
+
+        Args:
+            message (str): Description of the metrics error.
+            error_code (str): Unique error code (default: "METRICS_000")
+            context (dict): Additional contextual information (default: None)
+        """
+        self._init_error(message, error_code, context)
+        super().__init__(message)

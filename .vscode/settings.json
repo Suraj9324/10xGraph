@@ -1,0 +1,14 @@
+{
+    "cSpell.words": [
+        "agentflow",
+        "atrim",
+        "checkpointer",
+        "tenxgraph"
+    ],
+    "makefile.configureOnOpen": false,
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
+}

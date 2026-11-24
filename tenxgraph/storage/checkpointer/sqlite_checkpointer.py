@@ -1,0 +1,987 @@
+"""SQLite-backed checkpointer for client-side and single-user agent workloads.
+
+This module provides :class:`SqliteCheckpointer`, a :class:`BaseCheckpointer`
+implementation that keeps *everything* — durable state, the hot "realtime" state
+cache, a generic TTL cache, messages, and threads — in a single local SQLite
+database file. No external services (Postgres, Redis) are required.
+
+It is the right choice for:
+
+- Client-side / embedded agents: a desktop app (Tauri, Electron, PyInstaller)
+  that ships a Python sidecar, or a local CLI agent.
+- Dedicated-room deployments where each user has their own process and their own
+  database file.
+
+It is **not** the right choice for multi-user servers where many users share one
+backend. SQLite serializes writers and does not scale horizontally; use
+:class:`~tenxgraph.storage.checkpointer.pg_checkpointer.PgCheckpointer` there.
+
+Install with::
+
+    pip install 10xgraph[sqlite_checkpoint]
+"""
+
+import asyncio
+import json
+import logging
+import time
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from datetime import timedelta
+from enum import Enum
+from pathlib import Path
+from typing import Any, TypeVar
+
+from tenxgraph.core.authz import owner_id
+from tenxgraph.core.exceptions import MessageNotFoundError, ThreadNotFoundError
+from tenxgraph.core.state import AgentState, Message
+from tenxgraph.utils.private_fs import mkdir_private, touch_private
+from tenxgraph.utils.thread_info import ThreadInfo
+
+from .base_checkpointer import (
+    BaseCheckpointer,
+    _reject_filters,
+    _reject_tenant_options,
+    reject_unstorable,
+    validate_page,
+)
+
+
+try:
+    import aiosqlite
+
+    HAS_AIOSQLITE = True
+except ImportError:
+    HAS_AIOSQLITE = False
+    aiosqlite = None  # type: ignore[assignment]
+
+logger = logging.getLogger("tenxgraph.checkpointer.sqlite")
+
+StateT = TypeVar("StateT", bound="AgentState")
+
+
+# Default database location for desktop / single-user agents.
+def _default_home_dir() -> Path:
+    """Return ``~/.10xgraph``, falling back to a pre-existing legacy ``~/.agentflow``."""
+    home = Path.home()
+    new_dir = home / ".10xgraph"
+    legacy_dir = home / ".agentflow"
+    if not new_dir.exists() and legacy_dir.exists():
+        return legacy_dir
+    return new_dir
+
+
+# Left unset: the home directory is looked up when a checkpointer is built, not at import, so
+# ``import tenxgraph`` works where there is no HOME and no passwd entry. Set it to override.
+DEFAULT_DB_PATH: str | None = None
+
+
+def _default_db_path() -> str:
+    return str(_default_home_dir() / "checkpointer.db")
+
+
+DDL_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS af_states (
+        thread_id TEXT NOT NULL PRIMARY KEY,
+        state_data TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS af_state_cache (
+        thread_id TEXT NOT NULL PRIMARY KEY,
+        state_data TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS af_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        message_data TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE (thread_id, message_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_af_messages_thread ON af_messages (thread_id)",
+    """
+    CREATE TABLE IF NOT EXISTS af_threads (
+        thread_id TEXT NOT NULL PRIMARY KEY,
+        thread_data TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS af_cache (
+        namespace TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        expires_at REAL,
+        PRIMARY KEY (namespace, key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_af_cache_namespace ON af_cache (namespace)",
+    # Thread ownership: first writer of a thread owns it. Used to enforce owner-only
+    # access when the caller identity (config["user"]) asks for it.
+    """
+    CREATE TABLE IF NOT EXISTS af_thread_owner (
+        thread_id TEXT NOT NULL PRIMARY KEY,
+        owner_id  TEXT NOT NULL
+    )
+    """,
+    # Tool execution ledger: a completed tool call is recorded against its id so a node
+    # replayed after a crash does not fire it again.
+    """
+    CREATE TABLE IF NOT EXISTS af_tool_executions (
+        thread_id TEXT NOT NULL,
+        tool_call_id TEXT NOT NULL,
+        result TEXT NOT NULL,
+        created_at REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (thread_id, tool_call_id)
+    )
+    """,
+)
+
+# Built after the created_at migration in asetup: a file made before the column existed
+# would fail it.
+LEDGER_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_af_tool_executions_created ON af_tool_executions (created_at)"
+)
+
+
+def _enum_handler(obj: Any) -> Any:
+    if isinstance(obj, Enum):
+        return obj.value
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _dumps(data: Any) -> str:
+    return json.dumps(data, default=_enum_handler)
+
+
+class SqliteCheckpointer(BaseCheckpointer[StateT]):
+    """SQLite-backed checkpointer that stores all data in one local ``.db`` file.
+
+    Everything a graph needs to persist — durable state, the realtime state
+    cache, generic TTL cache, messages, and threads — lives in a single SQLite
+    file accessed through ``aiosqlite`` (fully async). A single persistent
+    connection is opened lazily; WAL journal mode is enabled for better
+    read concurrency and writes are serialized behind an ``asyncio.Lock``.
+
+    Rows store state data only. On read they are rebuilt into the state class
+    bound by ``StateGraph.compile()`` (see :meth:`BaseCheckpointer.bind_state_type`),
+    matching :class:`~tenxgraph.storage.checkpointer.pg_checkpointer.PgCheckpointer`.
+
+    Args:
+        db_path: Path to the SQLite database file. Defaults to
+            ``~/.10xgraph/checkpointer.db`` (or ``~/.agentflow/checkpointer.db``
+            when only the legacy directory exists). Parent directories are created on
+            setup. Use ``":memory:"`` for an ephemeral in-process database
+            (useful for tests).
+
+    Raises:
+        ImportError: If ``aiosqlite`` is not installed.
+
+    Example::
+
+        checkpointer = SqliteCheckpointer("agent.db")
+        graph = builder.compile(checkpointer=checkpointer)
+        await graph.ainvoke({"messages": [...]}, config={"thread_id": "t1"})
+    """
+
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        *,
+        tenant_columns: Any = None,
+        extra_columns: Any = None,
+        row_level_security: bool = False,
+        record_tool_result: bool = True,
+    ) -> None:
+        # Tenant/extra columns and RLS need PgCheckpointer: fail loudly instead of ignoring.
+        _reject_tenant_options(
+            "SqliteCheckpointer",
+            tenant_columns=tenant_columns,
+            extra_columns=extra_columns,
+            row_level_security=row_level_security,
+        )
+        if not HAS_AIOSQLITE:
+            raise ImportError(
+                "SqliteCheckpointer requires 'aiosqlite'. "
+                "Install with: pip install 10xgraph[sqlite_checkpoint]"
+            )
+
+        if db_path == ":memory:":
+            self.db_path: str | Path = ":memory:"
+        else:
+            self.db_path = Path(db_path) if db_path else Path(DEFAULT_DB_PATH or _default_db_path())
+
+        # False turns the tool ledger off (see BaseCheckpointer.record_tool_result).
+        self.record_tool_result = record_tool_result
+        self._conn: aiosqlite.Connection | None = None
+        self._setup_done = False
+        self._setup_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _claim(self, conn: "aiosqlite.Connection", config: dict[str, Any]) -> str | None:
+        """Make the caller the owner of a new thread, or refuse a write to someone else's.
+
+        Runs inside the write transaction and reads the owner back, so of two writers racing
+        to create one thread the loser is refused (and its transaction rolled back) instead
+        of writing into the winner's. Returns the owner.
+
+        Raises:
+            ThreadNotFoundError: Another user owns the thread (writes always stay own).
+        """
+        user_id = owner_id(config)
+        key = self._get_config_key(config)
+        if user_id:
+            await conn.execute(
+                "INSERT OR IGNORE INTO af_thread_owner (thread_id, owner_id) VALUES (?, ?)",
+                (key, str(user_id)),
+            )
+        async with conn.execute(
+            "SELECT owner_id FROM af_thread_owner WHERE thread_id = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        owner = None if row is None else str(row["owner_id"])
+        if self._foreign_owner(config, owner, write=True):
+            raise ThreadNotFoundError(config.get("thread_id"))
+        return owner
+
+    async def _ensure_thread(
+        self, conn: "aiosqlite.Connection", config: dict[str, Any], owner: str | None
+    ) -> None:
+        """Create the thread record on the first write of a thread; never overwrite one.
+
+        Same fields as ``PgCheckpointer`` writes: id, owner, name and metadata from the config.
+        """
+        key = self._get_config_key(config)
+        info = ThreadInfo(
+            thread_id=key,
+            thread_name=config.get("thread_name", f"Thread {key}"),
+            user_id=owner,
+            metadata=config.get("thread_meta", {}),
+        )
+        await conn.execute(
+            "INSERT OR IGNORE INTO af_threads (thread_id, thread_data, updated_at) "
+            "VALUES (?, ?, ?)",
+            (key, _dumps(info.model_dump(mode="json")), time.time()),
+        )
+
+    async def _owner_denied(self, config: dict[str, Any], *, write: bool = False) -> bool:
+        """True when isolation is active and the caller may not see this thread.
+
+        Reads and deletes follow the caller's reach; ``write=True`` checks the caller owns it.
+        """
+        user_id = owner_id(config)
+        if not self._isolation_enabled(config, user_id, write=write):
+            return False
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT owner_id FROM af_thread_owner WHERE thread_id = ?",
+            (self._get_config_key(config),),
+        ) as cur:
+            row = await cur.fetchone()
+        return self._foreign_owner(config, None if row is None else row["owner_id"], write=write)
+
+    def _serialize_state(self, state: StateT) -> str:
+        return _dumps(self._encode_state(state))
+
+    def _deserialize_state(self, raw: str, thread_id: Any = None) -> StateT:
+        return self._decode_state(json.loads(raw), thread_id)
+
+    async def _ensure_setup(self) -> None:
+        if self._setup_done:
+            return
+        async with self._setup_lock:
+            if not self._setup_done:
+                await self.asetup()
+
+    async def _get_conn(self) -> "aiosqlite.Connection":
+        """Return the shared connection, opening and configuring it if needed."""
+        if self._conn is None:
+            self._prepare_db_file()
+            conn = await aiosqlite.connect(self.db_path)
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn = conn
+        return self._conn
+
+    def _prepare_db_file(self) -> None:
+        """Create the db directory (0o700) and an empty db file (0o600) before SQLite does.
+
+        SQLite gives the ``-wal`` and ``-shm`` files the mode of the database file, so they
+        are owner-only too. An existing directory or file keeps its mode.
+        """
+        if isinstance(self.db_path, Path):
+            mkdir_private(self.db_path.parent)
+            touch_private(self.db_path)
+
+    @asynccontextmanager
+    async def _write(self) -> AsyncIterator["aiosqlite.Connection"]:
+        """Serialize a write transaction and commit on success."""
+        conn = await self._get_conn()
+        async with self._write_lock:
+            try:
+                yield conn
+            except BaseException:
+                # Without this the half-done statements stay pending and the next
+                # successful write commits them.
+                await conn.rollback()
+                raise
+            await conn.commit()
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    async def asetup(self) -> None:
+        """Create the database directory (if any) and all required tables."""
+        conn = await self._get_conn()
+        async with self._write_lock:
+            for stmt in DDL_STATEMENTS:
+                await conn.execute(stmt)
+            await self._add_ledger_created_at(conn)
+            await conn.execute(LEDGER_INDEX)
+            await conn.commit()
+        self._setup_done = True
+        logger.info("SqliteCheckpointer setup complete: %s", self.db_path)
+
+    @staticmethod
+    async def _add_ledger_created_at(conn: "aiosqlite.Connection") -> None:
+        """Add ``created_at`` to a ledger table made before it existed.
+
+        The rows already there get the current time, so a prune right after the upgrade
+        does not drop the record of a run that is paused now.
+        """
+        async with conn.execute("PRAGMA table_info(af_tool_executions)") as cur:
+            columns = {row["name"] for row in await cur.fetchall()}
+        if "created_at" in columns:
+            return
+        await conn.execute(
+            "ALTER TABLE af_tool_executions ADD COLUMN created_at REAL NOT NULL DEFAULT 0"
+        )
+        await conn.execute("UPDATE af_tool_executions SET created_at = ?", (time.time(),))
+
+    # ------------------------------------------------------------------
+    # State — async
+    # ------------------------------------------------------------------
+
+    async def aput_state(self, config: dict[str, Any], state: StateT) -> StateT:
+        reject_unstorable(state)
+        await self._ensure_setup()
+        key = self._get_config_key(config)
+        data = self._serialize_state(state)
+        async with self._write() as conn:
+            await self._ensure_thread(conn, config, await self._claim(conn, config))
+            await conn.execute(
+                """
+                INSERT INTO af_states (thread_id, state_data, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    state_data = excluded.state_data,
+                    updated_at = excluded.updated_at
+                """,
+                (key, data, time.time()),
+            )
+            # Write-through, in the same transaction: a run reads the cache first, so
+            # leaving it behind would start the next run from the replaced state.
+            await self._upsert_state_cache(conn, key, data)
+        logger.debug("Stored state for thread: %s", key)
+        return state
+
+    async def aget_state(self, config: dict[str, Any]) -> StateT | None:
+        await self._ensure_setup()
+        if await self._owner_denied(config):
+            return None
+        key = self._get_config_key(config)
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT state_data FROM af_states WHERE thread_id = ?", (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._deserialize_state(row["state_data"], config.get("thread_id"))
+
+    async def aclear_state(self, config: dict[str, Any]) -> int:
+        """Remove the thread's state; returns 1 when one was removed, else 0.
+
+        0 is not "thread not found": the caller's own thread with no state also gives 0.
+        """
+        await self._ensure_setup()
+        key = self._get_config_key(config)
+        async with self._write() as conn:
+            # Checked under the write lock, so the owner cannot change before the delete.
+            if await self._owner_denied(config):
+                return 0  # no-op, do not reveal existence
+            cursor = await conn.execute("DELETE FROM af_states WHERE thread_id = ?", (key,))
+            # A run reads the cache first, so a cached copy would bring the state back.
+            await conn.execute("DELETE FROM af_state_cache WHERE thread_id = ?", (key,))
+        return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # State cache — async (hot layer, same file, no Redis)
+    # ------------------------------------------------------------------
+
+    async def aput_state_cache(self, config: dict[str, Any], state: StateT) -> StateT:
+        await self._ensure_setup()
+        # Same rule as aput_state, but a non-owner's write is dropped instead of raising: the
+        # first writer of a thread becomes its owner, so only its owner can read it back.
+        key = self._get_config_key(config)
+        data = self._serialize_state(state)
+        try:
+            async with self._write() as conn:
+                await self._claim(conn, config)
+                await self._upsert_state_cache(conn, key, data)
+        except ThreadNotFoundError:
+            pass
+        return state
+
+    @staticmethod
+    async def _upsert_state_cache(conn: Any, key: str, data: str) -> None:
+        """Write one thread's cached state on an open connection."""
+        await conn.execute(
+            """
+            INSERT INTO af_state_cache (thread_id, state_data, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                state_data = excluded.state_data,
+                updated_at = excluded.updated_at
+            """,
+            (key, data, time.time()),
+        )
+
+    async def aget_state_cache(self, config: dict[str, Any]) -> StateT | None:
+        await self._ensure_setup()
+        if await self._owner_denied(config):
+            return None
+        key = self._get_config_key(config)
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT state_data FROM af_state_cache WHERE thread_id = ?", (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._deserialize_state(row["state_data"], config.get("thread_id"))
+
+    async def aclear_state_cache(self, config: dict[str, Any]) -> bool:
+        await self._ensure_setup()
+        if await self._owner_denied(config):
+            return True  # no-op, do not reveal existence
+        key = self._get_config_key(config)
+        async with self._write() as conn:
+            await conn.execute("DELETE FROM af_state_cache WHERE thread_id = ?", (key,))
+        return True
+
+    # ------------------------------------------------------------------
+    # Generic cache — async (TTL, lazy prune on read)
+    # ------------------------------------------------------------------
+
+    async def _upsert_cache(
+        self,
+        namespace: str,
+        key: str,
+        value: Any,
+        ttl_seconds: int | None,
+        *,
+        replace_only_expired: bool,
+    ) -> bool:
+        """Insert or replace one cache row; True when a row was written."""
+        await self._ensure_setup()
+        now = time.time()
+        expires_at = now + ttl_seconds if ttl_seconds else None
+        sql = """
+            INSERT INTO af_cache (namespace, key, value, expires_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(namespace, key) DO UPDATE SET
+                value = excluded.value,
+                expires_at = excluded.expires_at
+            """
+        params: tuple[Any, ...] = (namespace, key, _dumps(value), expires_at)
+        if replace_only_expired:
+            sql += "WHERE af_cache.expires_at IS NOT NULL AND af_cache.expires_at <= ?"
+            params += (now,)
+        async with self._write() as conn:
+            cursor = await conn.execute(sql, params)
+            return cursor.rowcount > 0
+
+    async def aput_cache_value(
+        self,
+        namespace: str,
+        key: str,
+        value: Any,
+        ttl_seconds: int | None = None,
+    ) -> Any | None:
+        reject_unstorable(value)
+        await self._upsert_cache(namespace, key, value, ttl_seconds, replace_only_expired=False)
+        return value
+
+    async def aget_cache_value(self, namespace: str, key: str) -> Any | None:
+        await self._ensure_setup()
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT value, expires_at FROM af_cache WHERE namespace = ? AND key = ?",
+            (namespace, key),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        expires_at = row["expires_at"]
+        if expires_at is not None and expires_at <= time.time():
+            async with self._write() as conn:
+                await conn.execute(
+                    "DELETE FROM af_cache WHERE namespace = ? AND key = ?",
+                    (namespace, key),
+                )
+            return None
+        return json.loads(row["value"])
+
+    async def aclear_cache_value(self, namespace: str, key: str) -> bool:
+        await self._ensure_setup()
+        async with self._write() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM af_cache WHERE namespace = ? AND key = ?",
+                (namespace, key),
+            )
+            return cursor.rowcount > 0
+
+    async def aclear_cache_value_if(self, namespace: str, key: str, expected: Any) -> bool:
+        """Compare and delete in one statement."""
+        await self._ensure_setup()
+        async with self._write() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM af_cache WHERE namespace = ? AND key = ? AND value = ?",
+                (namespace, key, _dumps(expected)),
+            )
+            return cursor.rowcount > 0
+
+    async def aput_cache_value_if_absent(
+        self,
+        namespace: str,
+        key: str,
+        value: Any,
+        ttl_seconds: int | None = None,
+    ) -> bool:
+        """Insert unless a live value exists, in one statement; an expired row is replaced."""
+        reject_unstorable(value)
+        return await self._upsert_cache(
+            namespace, key, value, ttl_seconds, replace_only_expired=True
+        )
+
+    async def alist_cache_keys(
+        self,
+        namespace: str,
+        prefix: str | None = None,
+    ) -> list[str]:
+        await self._ensure_setup()
+        async with self._write() as conn:
+            await conn.execute(
+                "DELETE FROM af_cache WHERE namespace = ? AND expires_at IS NOT NULL "
+                "AND expires_at <= ?",
+                (namespace, time.time()),
+            )
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT key FROM af_cache WHERE namespace = ?", (namespace,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        keys = [row["key"] for row in rows]
+        if prefix is not None:
+            keys = [k for k in keys if k.startswith(prefix)]
+        return keys
+
+    # ------------------------------------------------------------------
+    # Messages — async
+    # ------------------------------------------------------------------
+
+    async def aput_messages(
+        self,
+        config: dict[str, Any],
+        messages: list[Message],
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        reject_unstorable(messages, metadata)
+        await self._ensure_setup()
+        key = self._get_config_key(config)
+        now = time.time()
+        async with self._write() as conn:
+            await self._ensure_thread(conn, config, await self._claim(conn, config))
+            for given in messages:
+                msg = given
+                if metadata:
+                    # The message's own keys win.
+                    msg = given.model_copy(
+                        update={"metadata": {**metadata, **(given.metadata or {})}}
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO af_messages (thread_id, message_id, message_data, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(thread_id, message_id) DO UPDATE SET
+                        message_data = excluded.message_data
+                    """,
+                    (key, str(msg.message_id), _dumps(msg.model_dump(mode="json")), now),
+                )
+        logger.debug("Stored %d messages for thread: %s", len(messages), key)
+        return True
+
+    async def aget_message(self, config: dict[str, Any], message_id: str | int) -> Message:
+        await self._ensure_setup()
+        key = self._get_config_key(config)
+        if await self._owner_denied(config):
+            raise MessageNotFoundError
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT message_data FROM af_messages WHERE thread_id = ? AND message_id = ?",
+            (key, str(message_id)),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise MessageNotFoundError
+        return Message.model_validate(json.loads(row["message_data"]))
+
+    async def aupdate_message_metadata(
+        self,
+        config: dict[str, Any],
+        message_id: str | int,
+        metadata: dict[str, Any],
+    ) -> Message | None:
+        reject_unstorable(metadata)
+        await self._ensure_setup()
+        if await self._owner_denied(config, write=True):
+            return None  # a write: it stays own whatever the reach
+        key = self._get_config_key(config)
+        # Read and write under the write lock so two updates cannot lose each other's keys.
+        async with self._write() as conn:
+            async with conn.execute(
+                "SELECT message_data FROM af_messages WHERE thread_id = ? AND message_id = ?",
+                (key, str(message_id)),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+            message = Message.model_validate(json.loads(row["message_data"]))
+            message.metadata = {**(message.metadata or {}), **metadata}
+            await conn.execute(
+                "UPDATE af_messages SET message_data = ? WHERE thread_id = ? AND message_id = ?",
+                (_dumps(message.model_dump(mode="json")), key, str(message_id)),
+            )
+        return message
+
+    async def alist_messages(
+        self,
+        config: dict[str, Any],
+        search: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> list[Message]:
+        start, limit = validate_page(offset, limit)
+        await self._ensure_setup()
+        if await self._owner_denied(config):
+            return []
+        key = self._get_config_key(config)
+        conn = await self._get_conn()
+        sql = "SELECT message_data FROM af_messages WHERE thread_id = ? ORDER BY id"
+        params: list[Any] = [key]
+        if not search:
+            # No text filter: the window is applied by SQLite, so only it is read.
+            sql += " LIMIT ? OFFSET ?"
+            params += [limit if limit else -1, start]
+        needle = search.lower() if search else None
+        messages: list[Message] = []
+        skipped = 0
+        async with conn.execute(sql, params) as cursor:
+            async for row in cursor:
+                msg = Message.model_validate(json.loads(row["message_data"]))
+                if needle is not None:
+                    if needle not in msg.text().lower():
+                        continue
+                    # The match depends on the decoded message, so skip and stop here.
+                    if skipped < start:
+                        skipped += 1
+                        continue
+                messages.append(msg)
+                if needle is not None and limit and len(messages) >= limit:
+                    break
+        return messages
+
+    async def adelete_message(self, config: dict[str, Any], message_id: str | int) -> int:
+        """Delete one message; returns 1 when deleted, 0 when the caller may see no such one."""
+        await self._ensure_setup()
+        key = self._get_config_key(config)
+        async with self._write() as conn:
+            if await self._owner_denied(config):
+                return 0
+            deleted = await conn.execute(
+                "DELETE FROM af_messages WHERE thread_id = ? AND message_id = ?",
+                (key, str(message_id)),
+            )
+            if deleted.rowcount == 0:
+                return 0
+            # The state and its cache copy carry the message too; remove it there in the
+            # same transaction so a deleted message cannot come back on the next run.
+            for table in ("af_states", "af_state_cache"):
+                async with conn.execute(
+                    f"SELECT state_data FROM {table} WHERE thread_id = ?",  # noqa: S608
+                    (key,),
+                ) as cursor:
+                    state_row = await cursor.fetchone()
+                if state_row is None:
+                    continue
+                payload = json.loads(state_row["state_data"])
+                if self._strip_message_from_payload(payload, message_id):
+                    await conn.execute(
+                        f"UPDATE {table} SET state_data = ? WHERE thread_id = ?",  # noqa: S608
+                        (_dumps(payload), key),
+                    )
+        return 1
+
+    # ------------------------------------------------------------------
+    # Threads — async
+    # ------------------------------------------------------------------
+
+    async def aput_thread(self, config: dict[str, Any], thread_info: ThreadInfo) -> bool:
+        reject_unstorable(thread_info)
+        await self._ensure_setup()
+        key = self._get_config_key(config) or str(thread_info.thread_id)
+        if str(thread_info.thread_id) != key:
+            raise ValueError(
+                "ThreadInfo.thread_id must match config['thread_id']: "
+                f"{thread_info.thread_id!r} != {key!r}"
+            )
+        record = thread_info.model_dump(mode="json")
+        async with self._write() as conn:
+            owner = await self._claim(conn, config)
+            if owner is not None and str(record.get("user_id")) != owner:
+                record["user_id"] = owner  # the stored owner, never one named by thread_info
+            data = _dumps(record)
+            cursor = await conn.execute("SELECT 1 FROM af_threads WHERE thread_id = ?", (key,))
+            created = await cursor.fetchone() is None
+            await conn.execute(
+                """
+                INSERT INTO af_threads (thread_id, thread_data, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    thread_data = excluded.thread_data,
+                    updated_at = excluded.updated_at
+                """,
+                (key, data, time.time()),
+            )
+        return created
+
+    async def aget_thread(self, config: dict[str, Any]) -> ThreadInfo | None:
+        await self._ensure_setup()
+        if await self._owner_denied(config):
+            return None
+        key = self._get_config_key(config)
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT thread_data FROM af_threads WHERE thread_id = ?", (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return ThreadInfo.model_validate(json.loads(row["thread_data"]))
+
+    async def aget_thread_owner(self, thread_id: str | int) -> str | int | None:
+        """Return the owning ``user_id`` for ``thread_id`` (global, not owner-scoped)."""
+        await self._ensure_setup()
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT thread_data FROM af_threads WHERE thread_id = ?", (str(thread_id),)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            return json.loads(row["thread_data"]).get("user_id")
+        async with conn.execute(
+            "SELECT owner_id FROM af_thread_owner WHERE thread_id = ?", (str(thread_id),)
+        ) as cursor:
+            owner_row = await cursor.fetchone()
+        return None if owner_row is None else owner_row["owner_id"]
+
+    async def alist_threads(
+        self,
+        config: dict[str, Any],
+        search: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[ThreadInfo]:
+        _reject_filters("SqliteCheckpointer", filters)
+        start, limit = validate_page(offset, limit)
+        await self._ensure_setup()
+        user_id = owner_id(config)
+        isolate = self._isolation_enabled(config, user_id)
+        conn = await self._get_conn()
+        sql = "SELECT thread_data FROM af_threads"
+        params: list[Any] = []
+        # Owner-scope the listing when the identity asks for it.
+        if isolate:
+            sql += " WHERE CAST(json_extract(thread_data, '$.user_id') AS TEXT) = ?"
+            params.append(str(user_id))
+        sql += " ORDER BY updated_at DESC"
+        if not search:
+            # No text filter: the window is applied by SQLite, so only it is read.
+            sql += " LIMIT ? OFFSET ?"
+            params += [limit if limit else -1, start]
+        needle = search.lower() if search else None
+        threads: list[ThreadInfo] = []
+        skipped = 0
+        async with conn.execute(sql, params) as cursor:
+            async for row in cursor:
+                thread = ThreadInfo.model_validate(json.loads(row["thread_data"]))
+                if needle is not None:
+                    if needle not in (thread.thread_name or "").lower():
+                        continue
+                    # The match depends on the decoded thread, so skip and stop here.
+                    if skipped < start:
+                        skipped += 1
+                        continue
+                threads.append(thread)
+                if needle is not None and limit and len(threads) >= limit:
+                    break
+        return threads
+
+    async def aclean_thread(self, config: dict[str, Any]) -> int:
+        """Delete the thread and its data.
+
+        Returns 1 when any row of the thread went (its record, owner row or any data, also for
+        a thread that never got a record), 0 when there is nothing the caller may see.
+        """
+        await self._ensure_setup()
+        key = self._get_config_key(config)
+        deleted = 0
+        async with self._write() as conn:
+            if await self._owner_denied(config):
+                return 0  # outside the caller's reach: no-op
+            for table in (
+                "af_threads",
+                "af_messages",
+                "af_states",
+                "af_state_cache",
+                "af_tool_executions",
+                "af_thread_owner",
+            ):
+                cursor = await conn.execute(
+                    f"DELETE FROM {table} WHERE thread_id = ?",  # noqa: S608
+                    (key,),
+                )
+                deleted += cursor.rowcount
+        await self._clear_run_keys(config)
+        return 1 if deleted else 0
+
+    # ------------------------------------------------------------------
+    # Tool execution ledger
+    # ------------------------------------------------------------------
+
+    async def aget_tool_result(
+        self,
+        config: dict[str, Any],
+        tool_call_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the recorded result of a completed tool call, if there is one."""
+        await self._ensure_setup()
+        if await self._owner_denied(config):
+            return None  # not the owner -> no record, do not reveal existence
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT result FROM af_tool_executions WHERE thread_id = ? AND tool_call_id = ?",
+            (self._get_config_key(config), str(tool_call_id)),
+        ) as cur:
+            row = await cur.fetchone()
+        return json.loads(row["result"]) if row else None
+
+    async def aput_tool_result(
+        self,
+        config: dict[str, Any],
+        tool_call_id: str,
+        result: dict[str, Any],
+    ) -> Any | None:
+        """Durably record that a tool call completed; the first recorded result wins."""
+        reject_unstorable(result)
+        await self._ensure_setup()
+        async with self._write() as conn:
+            await self._ensure_thread(conn, config, await self._claim(conn, config))
+            await conn.execute(
+                "INSERT OR IGNORE INTO af_tool_executions "
+                "(thread_id, tool_call_id, result, created_at) VALUES (?, ?, ?, ?)",
+                (self._get_config_key(config), str(tool_call_id), _dumps(result), time.time()),
+            )
+        return True
+
+    async def aclear_tool_results(
+        self,
+        config: dict[str, Any],
+        origin_message_ids: Sequence[str] | None = None,
+    ) -> int:
+        """Delete the thread's ledger rows (only those of ``origin_message_ids`` when given).
+
+        A row belongs to an origin id when its key starts with ``"<id>:"``, compared with
+        ``substr`` on bound values (no LIKE, so ``%`` and ``_`` in ids stay literal).
+        """
+        if origin_message_ids is not None and not origin_message_ids:
+            return 0
+        await self._ensure_setup()
+        thread_id = self._get_config_key(config)
+        async with self._write() as conn:
+            if await self._owner_denied(config, write=True):
+                return 0
+            if origin_message_ids is None:
+                cursor = await conn.execute(
+                    "DELETE FROM af_tool_executions WHERE thread_id = ?", (thread_id,)
+                )
+                return cursor.rowcount
+            deleted = 0
+            for origin in dict.fromkeys(f"{i}:" for i in origin_message_ids):
+                cursor = await conn.execute(
+                    "DELETE FROM af_tool_executions "
+                    "WHERE thread_id = ? AND substr(tool_call_id, 1, length(?)) = ?",
+                    (thread_id, origin, origin),
+                )
+                deleted += cursor.rowcount
+        return deleted
+
+    async def aprune_tool_results(self, older_than: timedelta) -> int:
+        """Delete ledger rows of every thread recorded more than ``older_than`` ago."""
+        await self._ensure_setup()
+        async with self._write() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM af_tool_executions WHERE created_at < ?",
+                (time.time() - older_than.total_seconds(),),
+            )
+        return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # Release
+    # ------------------------------------------------------------------
+
+    async def aping(self) -> None:
+        """Run ``SELECT 1`` on the database connection.
+
+        Read-only. Uses the shared connection, so it opens the database file if this
+        checkpointer has not yet; it creates no tables.
+
+        Raises:
+            Exception: When the database cannot be opened or queried.
+        """
+        conn = await self._get_conn()
+        async with conn.execute("SELECT 1") as cursor:
+            await cursor.fetchone()
+
+    async def arelease(self) -> bool:
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
+            self._setup_done = False
+        logger.info("SqliteCheckpointer released: %s", self.db_path)
+        return True

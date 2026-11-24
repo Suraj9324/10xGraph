@@ -1,0 +1,582 @@
+"""Tool execution node for TAF graph workflows.
+
+This module provides the ToolNode class, which serves as a unified registry and executor
+for callable functions from various sources including local functions and MCP (Model Context
+Protocol) tools. The ToolNode is designed with a modular architecture using mixins to handle
+different tool providers.
+
+The ToolNode maintains compatibility with TAF's dependency injection system and
+publishes execution events for monitoring and debugging purposes.
+
+Typical usage example:
+    ```python
+    def my_tool(query: str) -> str:
+        return f"Result for: {query}"
+
+
+    tools = ToolNode([my_tool])
+    result = await tools.invoke("my_tool", {"query": "test"}, "call_id", config, state)
+    ```
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+import typing as t
+
+from injectq import Inject
+
+from tenxgraph.core.state import AgentState, ErrorBlock, Message, ToolResultBlock
+from tenxgraph.core.state.message_block import RemoteToolCallBlock
+from tenxgraph.core.state.stream_emitter import StreamEmitter
+from tenxgraph.runtime.publisher.events import EventType
+from tenxgraph.runtime.publisher.publish import publish_event
+from tenxgraph.utils import CallbackManager
+from tenxgraph.utils.injection import fresh
+from tenxgraph.utils.log_safety import log_safe
+from tenxgraph.utils.validators import clean_unstorable
+
+from . import deps
+from ._helpers import publish_tool_end, tool_start_event
+from .local_exec import LocalExecMixin, check_credential_annotation
+from .mcp_auth import MCPAuth, install_mcp_auth
+from .mcp_exec import DEFAULT_MCP_CONNECT_TIMEOUT, MCPMixin
+from .run_tools import run_remote_tools, tool_name
+from .schema import SchemaMixin
+
+
+logger = logging.getLogger("tenxgraph.graph.tool_node")
+
+
+class ToolNode(
+    SchemaMixin,
+    LocalExecMixin,
+    MCPMixin,
+):
+    """A unified registry and executor for callable functions from various tool providers.
+
+    ToolNode serves as the central hub for managing and executing tools from multiple sources:
+    - Local Python functions
+    - MCP (Model Context Protocol) tools
+
+    The class uses a mixin-based architecture to separate concerns and maintain clean
+    integration with different tool providers. It provides both synchronous and asynchronous
+    execution methods with comprehensive event publishing and error handling.
+
+    Attributes:
+        _funcs: Dictionary mapping function names to callable functions.
+        _client: Optional MCP client for remote tool execution.
+        mcp_tools: List of available MCP tool names.
+
+    Example:
+        ```python
+        # Define local tools
+        def weather_tool(location: str) -> str:
+            return f"Weather in {location}: Sunny, 25°C"
+
+
+        def calculator(a: int, b: int) -> int:
+            return a + b
+
+
+        # Create ToolNode with local functions
+        tools = ToolNode([weather_tool, calculator])
+
+        # Execute a tool
+        result = await tools.invoke(
+            name="weather_tool",
+            args={"location": "New York"},
+            tool_call_id="call_123",
+            config={"user_id": "user1"},
+            state=agent_state,
+        )
+        ```
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        tools: t.Iterable[t.Callable],
+        client: deps.Client | None = None,  # type: ignore
+        pass_user_info_to_mcp: bool = False,
+        max_result_chars: int | None = None,
+        mcp_include: t.Iterable[str] | None = None,
+        mcp_exclude: t.Iterable[str] | None = None,
+        mcp_prefix: str | None = None,
+        mcp_max_result_chars: int | None = None,
+        mcp_max_description_chars: int | None = None,
+        mcp_cache_tools: bool = True,
+        mcp_connect_timeout: float | None = DEFAULT_MCP_CONNECT_TIMEOUT,
+        mcp_auth: MCPAuth | None = None,
+        fence_results: bool = True,
+    ) -> None:
+        """Initialize ToolNode with functions and optional MCP client.
+
+        Args:
+            tools: Iterable of callable functions to register as tools. Each function
+                will be registered with its `__name__` as the tool identifier.
+            client: Optional MCP (Model Context Protocol) client for remote tool access.
+                Requires 'fastmcp' and 'mcp' packages to be installed.
+            pass_user_info_to_mcp: If True, sends the caller as request metadata
+                (``meta={"user": ...}``) on every MCP tool call, readable on the server via
+                `ctx.request_context.meta`. An ``Identity`` in ``config["user"]`` (what the
+                API sets) is sent as its JSON dump: user_id, kind, tenant, roles,
+                permissions, reach and the token claims. A dict is sent as is; with neither,
+                ``{"user_id": config["user_id"]}``. Defaults to False.
+
+            max_result_chars: Optional cap on the text a local tool returns. Longer
+                text is cut and a marker is appended, so one huge result is not saved to
+                state and re-sent to the model on every turn. ``None`` (default) means
+                no cap.
+            mcp_include: Optional allow-list of MCP tool names. Only these are shown to
+                the model and callable. ``None`` means every tool the server lists.
+            mcp_exclude: Optional MCP tool names to hide and refuse, applied after
+                ``mcp_include``. Both match the server's own tool names, without the prefix.
+            mcp_prefix: Optional string put in front of every MCP tool name the model
+                sees (for example ``"github_"``), so two ToolNodes can expose servers with
+                the same tool name. The prefix is removed again before the server call.
+            mcp_max_result_chars: Optional cap on the text of one MCP tool result. Longer
+                output is cut and a marker is appended. ``None`` (default) means no cap.
+            mcp_max_description_chars: Optional cap on an MCP tool description. ``None``
+                (default) means no cap.
+            mcp_cache_tools: When True (default) the server's tool list is fetched once and
+                reused, which saves a connect and list round trip per model call.
+                Call ``await tool_node.refresh_mcp_tools()`` to fetch it again. Set False to
+                list the server on every call.
+            mcp_connect_timeout: Seconds to wait for the MCP connection to open (default
+                30). Only the connect is bounded, never a tool call. ``None`` waits without
+                a limit.
+            mcp_auth: Optional async callable ``(MCPAuthContext) -> dict[str, str]`` that
+                returns HTTP headers for one MCP request, so each user's calls carry their
+                own auth (token exchange, a self-issued token, ...). It runs before every
+                tool listing and tool call with the run's identity and credential; the
+                headers go on that request only, on top of any transport ``auth=``, and win
+                on the same header name. ``forward_credential`` forwards the caller's token
+                unchanged (only for a server that accepts that same token). Needs
+                fastmcp>=4.1.7 and an HTTP transport (streamable HTTP or SSE). The tool list
+                is cached per node and shared by all users (``mcp_cache_tools``), and is
+                fetched with whichever run asks first: a server must not return a per-user
+                tool list here.
+            fence_results: When True (default) the text of every tool result (local, MCP
+                and client tools) reaches the model inside a ``<tool_output_xxxxxxxx>``
+                fence, with one system prompt line saying its content is data, not
+                instructions. Only the model request is fenced: the saved messages, events
+                and traces keep the plain output. Results the framework writes itself
+                (handoffs, skill tools, policy denials) are not fenced. The Agent that uses
+                this ToolNode reads the setting. Set False to send the raw text, as in 1.0.
+
+        Tools may take a parameter named ``credential``: it always receives the caller's
+        ``UserCredential`` from ``config["credential"]`` (or None), whatever its annotation,
+        and is hidden from the model.
+
+        Raises:
+            ImportError: If MCP client is provided but required packages are not installed,
+                or ``mcp_auth`` is set with fastmcp older than 4.
+            TypeError: If any item in tools is not callable.
+            ValueError: If ``mcp_auth`` is set without a client, or the client's transport
+                cannot send HTTP headers (stdio, in-memory).
+
+        Note:
+            When using MCP client functionality, ensure you have installed the required
+            dependencies with: `pip install 10xgraph[mcp]`
+
+        Example:
+            ```python
+            # Create ToolNode with user info passing enabled
+            tools = ToolNode([my_tool], client=mcp_client, pass_user_info_to_mcp=True)
+
+            # When invoking, the 'user' dict from config will be sent to MCP
+            result = await tools.invoke(
+                name="my_tool",
+                args={"param": "value"},
+                tool_call_id="call_123",
+                config={"user": {"id": "user1", "name": "John"}},
+                state=agent_state,
+            )
+            # On the MCP server, access via ctx.request_context.meta
+            ```
+        """
+        tools = list(tools)
+        logger.info("Initializing ToolNode with %d tools", len(tools))
+
+        if client is not None:
+            # Read flags dynamically so tests can patch tenxgraph.graph.tool_node.HAS_*
+            mod = sys.modules.get("tenxgraph.graph.tool_node")
+            has_fastmcp = getattr(mod, "HAS_FASTMCP", deps.HAS_FASTMCP) if mod else deps.HAS_FASTMCP
+            has_mcp = getattr(mod, "HAS_MCP", deps.HAS_MCP) if mod else deps.HAS_MCP
+
+            if not has_fastmcp or not has_mcp:
+                raise ImportError(
+                    "MCP client functionality requires 'fastmcp' and 'mcp' packages. "
+                    "Install with: pip install 10xgraph[mcp]"
+                )
+            logger.debug("ToolNode initialized with MCP client")
+
+        self.fence_results = fence_results
+        self._mcp_auth: MCPAuth | None = mcp_auth
+        self._mcp_server_url: str | None = None
+        if mcp_auth is not None:
+            if client is None:
+                raise ValueError("mcp_auth needs an MCP client (client=...)")
+            self._mcp_server_url = install_mcp_auth(client)
+
+        self._funcs: dict[str, t.Callable] = {}
+        self._client: deps.Client | None = client  # type: ignore
+        self._pass_user_info_to_mcp: bool = pass_user_info_to_mcp
+        self._max_result_chars: int | None = max_result_chars
+        self._mcp_include: frozenset[str] | None = (
+            frozenset(mcp_include) if mcp_include is not None else None
+        )
+        self._mcp_exclude: frozenset[str] = frozenset(mcp_exclude or ())
+        self._mcp_prefix: str | None = mcp_prefix or None
+        self._mcp_max_result_chars: int | None = mcp_max_result_chars
+        self._mcp_max_description_chars: int | None = mcp_max_description_chars
+        self._mcp_cache_tools: bool = mcp_cache_tools
+        self._mcp_connect_timeout: float | None = mcp_connect_timeout
+        self._mcp_tools_cache: list[t.Any] | None = None
+
+        for tool in tools:
+            if not callable(tool):
+                raise TypeError("ToolNode only accepts callables")
+            self._register(tool)
+
+        self.mcp_tools: list[str] = []
+        self.remote_tools: list[dict] = []
+        self.remote_tool_names: list[str] = []
+
+    def _register(self, tool: t.Callable) -> None:
+        existing = self._funcs.get(tool.__name__)
+        if existing is not None and existing is not tool:
+            logger.warning(
+                "Tool name '%s' is already registered on this ToolNode; the earlier tool "
+                "is replaced.",
+                log_safe(tool.__name__),
+            )
+        check_credential_annotation(tool)
+        self._funcs[tool.__name__] = tool
+
+    def add_tool(self, tool: t.Callable) -> None:
+        """Add a single tool to the ToolNode after initialization.
+
+        This method allows dynamic addition of tools to an existing ToolNode,
+        useful for cases like skills where tools need to be added programmatically.
+
+        Args:
+            tool: A callable function to register as a tool. The function will be
+                registered with its `__name__` as the tool identifier.
+
+        Raises:
+            TypeError: If the provided tool is not callable.
+
+        Example:
+            ```python
+            tool_node = ToolNode([existing_tool])
+
+
+            def new_tool(param: str) -> str:
+                return f"Result: {param}"
+
+
+            tool_node.add_tool(new_tool)
+            ```
+        """
+        if not callable(tool):
+            raise TypeError("ToolNode.add_tool() only accepts callables")
+        self._register(tool)
+        logger.debug(f"Added tool '{tool.__name__}' to ToolNode")
+
+    async def _all_tools_async(
+        self,
+        tags: set[str] | None = None,
+        config: dict[str, t.Any] | None = None,
+    ) -> list[dict]:
+        tools: list[dict] = self.get_local_tool(tags=tags)
+        tools.extend(await self._get_mcp_tool(tags=tags, config=config))
+        tools.extend(self.remote_tools)
+        tools.extend(self._run_remote_tools(config, taken={tool_name(x) for x in tools}))
+        return tools
+
+    def _run_remote_tools(
+        self,
+        config: dict[str, t.Any] | None,
+        taken: set[str] | None = None,
+    ) -> list[dict]:
+        """Per-run client tools from ``config`` that do not shadow one of this node's tools."""
+        taken = set(taken or ()) | set(self._funcs) | set(self.mcp_tools)
+        taken |= set(self.remote_tool_names)
+        tools = []
+        for schema in run_remote_tools(config):
+            name = tool_name(schema)
+            if name in taken:
+                logger.warning(
+                    "Ignoring per-run client tool '%s': the ToolNode already has a tool "
+                    "with that name",
+                    log_safe(name),
+                )
+                continue
+            tools.append(schema)
+        return tools
+
+    def _is_remote_call(self, name: str, config: dict[str, t.Any] | None) -> bool:
+        """Whether a call to ``name`` runs on the client (configured or per-run remote tool)."""
+        if name in self.remote_tool_names:
+            return True
+        return any(tool_name(x) == name for x in self._run_remote_tools(config))
+
+    def knows_tool(self, name: str, config: dict[str, t.Any] | None = None) -> bool:
+        """Whether ``invoke`` can route ``name``: local, MCP, remote or per-run client tool."""
+        return name in self._funcs or name in self.mcp_tools or self._is_remote_call(name, config)
+
+    def set_remote_tool(self, tool_names: list[dict]) -> None:
+        # already validated tool names
+        self.remote_tools = tool_names
+        self.remote_tool_names = [tool.get("function", {}).get("name") for tool in tool_names]
+
+    async def all_tools(
+        self,
+        tags: set[str] | None = None,
+        config: dict[str, t.Any] | None = None,
+    ) -> list[dict]:
+        """Get all available tools from all configured providers.
+
+        Retrieves and combines tool definitions from local functions, MCP client,
+        Composio adapter, and LangChain adapter. Each tool definition includes
+        the function schema with parameters and descriptions.
+
+        Args:
+            tags: Optional set of tags to filter tools. Only tools matching
+                the specified tags will be included in the result.
+            config: The run config. Client tools it carries under ``remote_tools``
+                are added for this run (see ``run_tools``).
+
+        Returns:
+            List of tool definitions in OpenAI function calling format. Each dict
+            contains 'type': 'function' and 'function' with name, description,
+            and parameters schema.
+
+        Example:
+            ```python
+            tools = await tool_node.all_tools(tags={"weather"})
+            # Returns:
+            # [
+            #   {
+            #     "type": "function",
+            #     "function": {
+            #       "name": "weather_tool",
+            #       "description": "Get weather information for a location",
+            #       "parameters": {
+            #         "type": "object",
+            #         "properties": {
+            #           "location": {"type": "string"}
+            #         },
+            #         "required": ["location"]
+            #       }
+            #     }
+            #   }
+            # ]
+            ```
+        """
+        return await self._all_tools_async(
+            tags=tags,
+            config=config,
+        )
+
+    def all_tools_sync(
+        self,
+        tags: set[str] | None = None,
+        config: dict[str, t.Any] | None = None,
+    ) -> list[dict]:
+        """Synchronously get all available tools from all configured providers.
+
+        This is a synchronous wrapper around the async all_tools() method. It
+        returns the same set of tools -- local, MCP and remote -- and uses
+        asyncio.run() to handle the async MCP listing.
+
+        Returns:
+            List of tool definitions in OpenAI function calling format.
+
+        Note:
+            Prefer using the async `all_tools()` method when possible, especially
+            in async contexts, to avoid potential event loop issues.
+        """
+        tools: list[dict] = self.get_local_tool(tags=tags)
+
+        if self._client:
+            result = asyncio.run(self._get_mcp_tool(tags=tags, config=config))
+            if result:
+                tools.extend(result)
+
+        # Must mirror ``_all_tools_async``: dropping remote tools here makes
+        # client-side tools silently invisible to the model.
+        tools.extend(self.remote_tools)
+        tools.extend(self._run_remote_tools(config, taken={tool_name(x) for x in tools}))
+
+        return tools
+
+    async def invoke(
+        self,
+        name: str,
+        args: dict,
+        tool_call_id: str,
+        config: dict[str, t.Any],
+        state: AgentState,
+        callback_manager: CallbackManager = Inject[CallbackManager],
+    ) -> dict[str, t.Any] | Message:
+        """Execute a specific tool by name with the provided arguments.
+
+        This method handles tool execution across all configured providers (local,
+        MCP, Composio, LangChain) with comprehensive error handling, event publishing,
+        and callback management.
+
+        Args:
+            name: The name of the tool to execute.
+            args: Dictionary of arguments to pass to the tool function.
+            tool_call_id: Unique identifier for this tool execution, used for
+                tracking and result correlation.
+            config: Configuration dictionary containing execution context and
+                user-specific settings.
+            state: Current agent state for context-aware tool execution.
+            callback_manager: Manager for executing pre/post execution callbacks.
+                Injected via dependency injection if not provided.
+
+        Returns:
+            Message object containing tool execution results, either successful
+            output or error information with appropriate status indicators.
+
+        Raises:
+            The method handles all exceptions internally and returns error Messages
+            rather than raising exceptions, ensuring robust execution flow.
+
+        Example:
+            ```python
+            result = await tool_node.invoke(
+                name="weather_tool",
+                args={"location": "Paris", "units": "metric"},
+                tool_call_id="call_abc123",
+                config={"user_id": "user1", "session_id": "session1"},
+                state=current_agent_state,
+            )
+
+            # result is a Message with tool execution results
+            print(result.content)  # Tool output or error information
+            ```
+
+        Note:
+            The method publishes execution events throughout the process for
+            monitoring and debugging purposes. Tool execution is routed based
+            on tool provider precedence: MCP → Local.
+        """
+        return await self._execute(name, args, tool_call_id, config, state, callback_manager)
+
+    async def _execute(
+        self,
+        name: str,
+        args: dict,
+        tool_call_id: str,
+        config: dict[str, t.Any],
+        state: AgentState,
+        callback_manager: CallbackManager,
+        emit: StreamEmitter | None = None,
+    ) -> dict[str, t.Any] | Message:
+        """Route one tool call (remote, MCP, local, unknown); ``invoke`` and ``stream`` share it."""
+        callback_manager = fresh(callback_manager)
+        logger.info("Executing tool '%s' with %d arguments", log_safe(name), len(args))
+        logger.debug("Tool arguments: %s", args)
+
+        # Local and MCP executors publish the tool's events; only the remote and unknown
+        # cases, which run nothing here, publish from this layer.
+        if self._is_remote_call(name, config):
+            publish_event(tool_start_event(config, name, args, tool_call_id, is_remote=True))
+            # The client runs this tool, so the graph is interrupted here.
+            return Message(
+                content=[RemoteToolCallBlock(id=tool_call_id, name=name, args=args)],
+                role="tool",
+                metadata={"is_remote": True},
+            )
+
+        if name in self.mcp_tools:
+            return clean_unstorable(
+                await self._mcp_execute(name, args, tool_call_id, config, callback_manager)
+            )
+
+        if name in self._funcs:
+            return clean_unstorable(
+                await self._internal_execute(
+                    name, args, tool_call_id, config, state, callback_manager, emit=emit
+                )
+            )
+
+        return self._unknown_tool(name, args, tool_call_id, config)
+
+    def _unknown_tool(
+        self, name: str, args: dict, tool_call_id: str, config: dict[str, t.Any]
+    ) -> Message:
+        """Publish START and ERROR for a tool that is not registered, and build its result."""
+        error_msg = f"Tool '{name}' not found."
+        event = tool_start_event(config, name, args, tool_call_id)
+        publish_event(event)
+        publish_tool_end(event, "Tool not found", error=error_msg, event_type=EventType.ERROR)
+        return Message.tool_message(
+            content=[
+                ErrorBlock(message=error_msg),
+                ToolResultBlock(
+                    call_id=tool_call_id,
+                    name=name,
+                    output=error_msg,
+                    is_error=True,
+                    status="failed",
+                ),
+            ],
+        )
+
+    async def stream(
+        self,
+        name: str,
+        args: dict,
+        tool_call_id: str,
+        config: dict[str, t.Any],
+        state: AgentState,
+        emit: StreamEmitter | None = None,
+        callback_manager: CallbackManager = Inject[CallbackManager],
+    ) -> t.AsyncIterator[Message | dict[str, t.Any]]:
+        """Execute a tool with streaming support, yielding incremental results.
+
+        Similar to invoke() but designed for tools that can provide streaming responses
+        or when you want to process results as they become available. Currently,
+        most tool providers return complete results, so this method typically yields
+        a single Message with the full result.
+
+        Args:
+            name: The name of the tool to execute.
+            args: Dictionary of arguments to pass to the tool function.
+            tool_call_id: Unique identifier for this tool execution.
+            config: Configuration dictionary containing execution context.
+            state: Current agent state for context-aware tool execution.
+            callback_manager: Manager for executing pre/post execution callbacks.
+
+        Yields:
+            Message objects containing tool execution results or status updates.
+            For most tools, this will yield a single complete result Message.
+
+        Example:
+            ```python
+            async for message in tool_node.stream(
+                name="data_processor",
+                args={"dataset": "large_data.csv"},
+                tool_call_id="call_stream123",
+                config={"user_id": "user1"},
+                state=current_state,
+            ):
+                print(f"Received: {message.content}")
+                # Process each streamed result
+            ```
+
+        Note:
+            The streaming interface is designed for future expansion where tools
+            may provide true streaming responses. Currently, it provides a
+            consistent async iterator interface over tool results.
+        """
+        yield await self._execute(
+            name, args, tool_call_id, config, state, callback_manager, emit=emit
+        )

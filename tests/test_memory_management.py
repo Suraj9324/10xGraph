@@ -1,0 +1,395 @@
+"""Comprehensive memory management and resource disposal tests.
+
+This module tests memory management, resource cleanup, and connection pooling
+across BackgroundTaskManager and all publisher implementations.
+"""
+
+import asyncio
+import gc
+import logging
+import time
+
+import pytest
+
+from tenxgraph.runtime.publisher.base_publisher import BasePublisher
+from tenxgraph.runtime.publisher.console_publisher import ConsolePublisher
+from tenxgraph.runtime.publisher.events import Event, EventModel, EventType
+from tenxgraph.utils.background_task_manager import BackgroundTaskManager
+
+
+logger = logging.getLogger(__name__)
+
+
+class TestBackgroundTaskManagerMemory:
+    """Test BackgroundTaskManager memory management and cleanup guarantees."""
+
+    @pytest.fixture
+    def task_manager(self):
+        """Create a fresh BackgroundTaskManager instance."""
+        return BackgroundTaskManager(default_shutdown_timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_all_tasks(self, task_manager):
+        """Test that shutdown properly cancels all running tasks."""
+        task_count = 5
+        running_flags = [False] * task_count
+
+        async def long_running_task(index):
+            running_flags[index] = True
+            try:
+                await asyncio.sleep(100)  # Very long sleep
+            except asyncio.CancelledError:
+                running_flags[index] = False
+                raise
+
+        # Create multiple long-running tasks
+        for i in range(task_count):
+            task_manager.create_task(long_running_task(i), name=f"task_{i}")
+
+        # Verify tasks are running
+        await asyncio.sleep(0.1)
+        assert all(running_flags)
+        assert task_manager.get_task_count() == task_count
+
+        # Shutdown should cancel all
+        stats = await task_manager.shutdown(timeout=2.0)
+
+        assert stats["status"] in ["completed", "timeout"]
+        assert stats["initial_tasks"] == task_count
+        # All tasks should be cancelled
+        assert all(not flag for flag in running_flags)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_waits_for_completion(self, task_manager):
+        """Test that shutdown waits for tasks to complete gracefully."""
+        completed = []
+        started = []
+
+        async def completable_task(index):
+            started.append(index)
+            # Use a short sleep that will complete before cancellation
+            await asyncio.sleep(0.05)
+            completed.append(index)
+
+        # Create tasks that complete quickly
+        for i in range(3):
+            task_manager.create_task(completable_task(i))
+
+        # Give tasks a moment to start
+        await asyncio.sleep(0.01)
+        assert len(started) == 3
+
+        stats = await task_manager.shutdown(timeout=2.0)
+
+        # Tasks should either complete naturally or be cancelled
+        # Since shutdown calls cancel_all, they will be cancelled
+        assert stats["status"] == "completed"
+        assert task_manager.get_task_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_timeout_force_cancels(self, task_manager):
+        """Test that shutdown times out when tasks don't respond."""
+
+        async def slow_but_cancellable_task():
+            # Task that takes time but responds to cancellation
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                # Respond to cancellation immediately
+                raise
+
+        task_manager.create_task(slow_but_cancellable_task(), name="slow_task")
+
+        start = time.time()
+        stats = await task_manager.shutdown(timeout=0.5)
+        duration = time.time() - start
+
+        # The task outlives the timeout, so it is cancelled after waiting for it
+        assert stats["status"] == "timeout"
+        assert 0.4 <= duration < 1.5
+        assert task_manager.get_task_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_idempotent(self, task_manager):
+        """Test that multiple shutdown calls are safe."""
+        async def quick_task():
+            await asyncio.sleep(0.05)
+
+        task_manager.create_task(quick_task())
+
+        # First shutdown
+        stats1 = await task_manager.shutdown()
+        assert stats1["status"] == "completed"
+
+        # Second shutdown should be no-op
+        stats2 = await task_manager.shutdown()
+        assert stats2["status"] == "already_shutdown"
+        assert stats2["tasks_remaining"] == 0
+
+    @pytest.mark.asyncio
+    async def test_context_manager_cleanup(self):
+        """Test that context manager properly cleans up resources."""
+        task_started = False
+        task_cancelled = False
+
+        async def tracked_task():
+            nonlocal task_started, task_cancelled
+            task_started = True
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                task_cancelled = True
+                raise
+
+        async with BackgroundTaskManager(default_shutdown_timeout=2.0) as manager:
+            manager.create_task(tracked_task())
+            await asyncio.sleep(0.1)
+            assert task_started
+            assert manager.get_task_count() == 1
+
+        # After exiting context (timeout reached), the leftover task is cancelled
+        assert task_cancelled
+
+    @pytest.mark.asyncio
+    async def test_no_memory_leak_on_many_tasks(self, task_manager):
+        """Test that creating many tasks doesn't leak memory."""
+        async def tiny_task():
+            await asyncio.sleep(0.001)
+
+        # Create and complete many tasks
+        for _ in range(100):
+            task_manager.create_task(tiny_task())
+            await asyncio.sleep(0.002)
+
+        # Wait for all to complete
+        await task_manager.wait_for_all()
+
+        # Force garbage collection
+        gc.collect()
+
+        # All tasks should be cleaned up
+        assert task_manager.get_task_count() == 0
+        assert len(task_manager._tasks) == 0
+        assert len(task_manager._task_metadata) == 0
+
+    @pytest.mark.asyncio
+    async def test_task_metadata_cleanup(self, task_manager):
+        """Test that task metadata is properly cleaned up."""
+        async def task_with_metadata():
+            await asyncio.sleep(0.05)
+
+        context = {"user": "test", "large_data": "x" * 1000}
+        task_manager.create_task(
+            task_with_metadata(),
+            name="metadata_task",
+            context=context,
+        )
+
+        # Initially metadata should exist
+        assert len(task_manager._task_metadata) == 1
+
+        await task_manager.wait_for_all()
+
+        # Metadata should be cleaned up
+        assert len(task_manager._task_metadata) == 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_shutdown_safe(self):
+        """Test that concurrent shutdown calls are thread-safe."""
+        manager = BackgroundTaskManager()
+
+        async def worker():
+            await asyncio.sleep(0.1)
+
+        for _ in range(5):
+            manager.create_task(worker())
+
+        # Try to shutdown concurrently
+        results = await asyncio.gather(
+            manager.shutdown(),
+            manager.shutdown(),
+            manager.shutdown(),
+            return_exceptions=True,
+        )
+
+        # All should complete without errors
+        assert all(isinstance(r, dict) for r in results)
+        # First should succeed, others should report already shutdown
+        completed_count = sum(
+            1 for r in results if isinstance(r, dict) and r.get("status") == "completed"
+        )
+        already_shutdown_count = sum(
+            1 for r in results if isinstance(r, dict) and r.get("status") == "already_shutdown"
+        )
+        assert completed_count >= 1
+        assert already_shutdown_count >= 2
+
+
+class TestPublisherResourceDisposal:
+    """Test proper resource disposal in all publisher implementations."""
+
+    @pytest.mark.asyncio
+    async def test_console_publisher_idempotent_close(self):
+        """Test that ConsolePublisher close is idempotent."""
+        publisher = ConsolePublisher()
+
+        # First close
+        await publisher.close()
+        assert publisher._is_closed
+
+        # Second close should be safe
+        await publisher.close()
+        assert publisher._is_closed
+
+        # Publishing after close should fail
+        event = EventModel(
+            event=Event.NODE_EXECUTION,
+            event_type=EventType.UPDATE,
+            node_name="test",
+            data={},
+        )
+        with pytest.raises(RuntimeError, match="closed"):
+            await publisher.publish(event)
+
+    @pytest.mark.asyncio
+    async def test_console_publisher_sync_close(self):
+        """Test synchronous close of ConsolePublisher."""
+        publisher = ConsolePublisher()
+        publisher.sync_close()
+        assert publisher._is_closed
+
+    @pytest.mark.asyncio
+    async def test_console_publisher_context_manager(self):
+        """Test ConsolePublisher as context manager."""
+        async with ConsolePublisher() as publisher:
+            assert not publisher._is_closed
+            event = EventModel(
+                event=Event.NODE_EXECUTION,
+                event_type=EventType.UPDATE,
+                node_name="test",
+                data={},
+            )
+            # Should be able to publish
+            await publisher.publish(event)
+
+        # After context exit, should be closed
+        assert publisher._is_closed
+
+    @pytest.mark.asyncio
+    async def test_base_publisher_interface(self):
+        """Test BasePublisher provides context manager interface."""
+
+        class TestPublisher(BasePublisher):
+            def __init__(self):
+                super().__init__({})
+                self.closed = False
+
+            async def publish(self, event):
+                if self._is_closed:
+                    raise RuntimeError("Publisher is closed")
+                return True
+
+            async def close(self):
+                self.closed = True
+                self._is_closed = True
+
+            def sync_close(self):
+                self.closed = True
+                self._is_closed = True
+
+        async with TestPublisher() as publisher:
+            event = EventModel(
+                event=Event.NODE_EXECUTION,
+                event_type=EventType.UPDATE,
+                node_name="test",
+                data={},
+            )
+            result = await publisher.publish(event)
+            assert result is True
+
+        assert publisher.closed
+
+
+class TestMemoryLeakDetection:
+    """Test for memory leaks in long-running scenarios."""
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.slow
+    async def test_no_leak_publisher_repeated_use(self):
+        """Test that repeated publisher use doesn't leak memory."""
+        publisher = ConsolePublisher()
+
+        event = EventModel(
+            event=Event.NODE_EXECUTION,
+            event_type=EventType.UPDATE,
+            node_name="test",
+            data={"iteration": 0},
+        )
+
+        # Publish many events
+        for i in range(1000):
+            event.data = {"iteration": i}
+            await publisher.publish(event)
+
+        await publisher.close()
+        gc.collect()
+
+        # Verify closed
+        assert publisher._is_closed
+
+
+class TestResourceLimits:
+    """Test that resource limits are properly enforced."""
+
+    @pytest.mark.asyncio
+    async def test_task_timeout_enforcement(self):
+        """Test that task timeouts are enforced."""
+        manager = BackgroundTaskManager()
+        timed_out = False
+
+        async def slow_task():
+            nonlocal timed_out
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                timed_out = True
+                raise
+
+        # Create task with short timeout
+        manager.create_task(slow_task(), timeout=0.2)
+
+        await asyncio.sleep(0.5)
+
+        assert timed_out
+        assert manager.get_task_count() == 0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
+
+
+class TestStressConcurrentOperations:
+    """Stress tests for concurrent operations and edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_rapid_create_and_cancel(self):
+        """Test rapid task creation and cancellation."""
+        manager = BackgroundTaskManager()
+
+        async def cancelable_task():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                pass
+
+        # Rapidly create tasks
+        for _ in range(50):
+            manager.create_task(cancelable_task())
+
+        # Immediately cancel all
+        await manager.cancel_all()
+        await asyncio.sleep(0.2)
+
+        # Should be cleaned up
+        assert manager.get_task_count() == 0

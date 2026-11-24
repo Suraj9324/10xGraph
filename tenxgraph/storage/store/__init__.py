@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from importlib import import_module as _import_module
+from typing import Any as _Any
+
+from .base_store import SYSTEM_USER_PREFIX, BaseStore, is_system_user_id, system_user_id
+from .embedding import BaseEmbedding, GoogleEmbedding, OpenAIEmbedding
+from .long_term_memory import (
+    ReadMode,
+    get_agent_memory_system_prompt,
+)
+from .memory_config import AgentMemoryConfig, MemoryConfig, UserMemoryConfig
+from .pgvector_store import PgVectorStore
+from .qdrant_store import (
+    DEFAULT_COLLECTION,
+    QdrantStore,
+    create_cloud_qdrant_store,
+    create_local_qdrant_store,
+    create_remote_qdrant_store,
+)
+from .store_schema import DistanceMetric, MemoryRecord, MemorySearchResult, MemoryType
+
+
+_MEMORY_TOOL_EXPORTS = {
+    "make_agent_memory_tool",
+    "make_user_memory_tool",
+}
+
+
+def __getattr__(name: str) -> _Any:
+    """Resolve prebuilt memory tools only when callers ask for them."""
+    if name in _MEMORY_TOOL_EXPORTS:
+        memory_tools = _import_module("tenxgraph.prebuilt.tools.memory")
+        value = getattr(memory_tools, name)
+        globals()[name] = value
+        return value
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "BaseEmbedding",
+    "BaseStore",
+    "DEFAULT_COLLECTION",
+    "DistanceMetric",
+    "GoogleEmbedding",
+    "MemoryConfig",
+    "MemoryRecord",
+    "MemorySearchResult",
+    "MemoryType",
+    "OpenAIEmbedding",
+    "PgVectorStore",
+    "QdrantStore",
+    "SYSTEM_USER_PREFIX",
+    "is_system_user_id",
+    "system_user_id",
+    "ReadMode",
+    "UserMemoryConfig",
+    "AgentMemoryConfig",
+    "create_cloud_qdrant_store",
+    "create_local_qdrant_store",
+    "create_remote_qdrant_store",
+    "get_agent_memory_system_prompt",
+    "make_agent_memory_tool",
+    "make_user_memory_tool",
+]
